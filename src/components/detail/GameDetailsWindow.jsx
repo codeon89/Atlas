@@ -1,0 +1,1216 @@
+import { useState, useEffect, useRef } from 'react'
+import { useTagState } from '../../hooks/useTagState.js'
+import WindowTitleBar from '../ui/WindowTitleBar.jsx'
+import RecordTab from './window/RecordTab.jsx'
+import VersionsTab from './window/VersionsTab.jsx'
+import MediaTab from './window/MediaTab.jsx'
+import MappingsTab from './window/MappingsTab.jsx'
+import ConfirmModal from '../ui/ConfirmModal.jsx'
+import { sanitizePercentText } from '../../utils/formatPercent.js'
+import { effectiveTitlePlaystate } from '../../utils/playstates.js'
+import { formatVersionDate } from '../../utils/formatVersionDate.js'
+import { formatReleaseDate } from './page/gameDetailUtils.js'
+import { toMediaSrc } from '../../utils/mediaSrc.js'
+
+const isRemoteMediaUrl = (url) => /^https?:\/\//i.test(String(url || ''))
+const firstMediaUrl = (value) => Array.isArray(value) ? value[0] || '' : value || ''
+const formatBytes = (bytes) => {
+  const value = Number(bytes)
+  if (!Number.isFinite(value) || value < 0) return 'Unknown'
+  const gb = value / (1024 * 1024 * 1024)
+  if (gb >= 1) return `${gb.toFixed(gb >= 10 ? 1 : 2)} GB`
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
+const EMPTY_FORM = {
+  title: '', mappings: '', platform: '', engine: '', developer: '',
+  publisher: '', release_date: '', status: '', tags: '', description: '',
+  category: '', latest_version: '', censored: '', language: '',
+  translations: '', genre: '', voice: '', rating: '', notes: '',
+}
+
+const EMPTY_VERSION = {
+  game_version: '', game_path: '', executable: '',
+  last_played: '', playtime: '', version_size: '', date_added: '',
+  last_played_title: '', date_added_title: '',
+}
+
+const sanitizeProgressState = (progress = {}) => ({
+  ...progress,
+  text: sanitizePercentText(progress.text),
+})
+
+// Normalizes any date-ish string to the strict YYYY-MM-DD form that an
+// <input type="date"> requires. Anything an input can't parse leaves the
+// field blank (showing the browser's mm/dd/yyyy placeholder).
+const toDateInputValue = (raw) => {
+  const str = String(raw || '').trim()
+  if (!str) return ''
+  // Already ISO (YYYY-MM-DD or YYYY-MM-DDThh...) — take the date part.
+  const isoMatch = str.match(/^(\d{4}-\d{2}-\d{2})/)
+  if (isoMatch) return isoMatch[1]
+  // Purely numeric — treat as a Unix timestamp in seconds.
+  if (/^\d+$/.test(str)) {
+    const date = new Date(parseInt(str, 10) * 1000)
+    return Number.isNaN(date.getTime()) ? '' : date.toISOString().split('T')[0]
+  }
+  // Anything else (e.g. Steam's "31 Aug, 2020" / "Aug 31, 2020") — let the
+  // Date parser handle it, then coerce to ISO. Use UTC noon to avoid a
+  // timezone rollback shifting the date to the previous day.
+  const parsed = new Date(str)
+  if (Number.isNaN(parsed.getTime())) return ''
+  const utc = new Date(Date.UTC(parsed.getFullYear(), parsed.getMonth(), parsed.getDate(), 12))
+  return utc.toISOString().split('T')[0]
+}
+
+// Resolves the release date for the editable record the SAME way the game
+// page does (formatReleaseDate: release_date, then steam_release_date, then
+// gog_release_date), then normalizes it for the date input. Previously this
+// only looked at g.release_date, so Steam/GOG games — whose date lives in
+// steam_release_date/gog_release_date with release_date empty — showed a
+// blank mm/dd/yyyy field here even though the game page displayed it fine.
+const formatRecordDateInput = (game) => toDateInputValue(formatReleaseDate(game))
+
+function gameToFormData(g) {
+  const mapperNames = []
+  if (g.f95_id) mapperNames.push('F95Zone')
+  if (g.atlas_id) mapperNames.push('Atlas')
+  if (g.steam_id) mapperNames.push('Steam')
+  if (g.lc_id || g.lcId || g.lewdCornerId) mapperNames.push('LewdCorner')
+  return {
+    title: g.title || '',
+    mappings: mapperNames.join(', '),
+    platform: g.os || '',
+    engine: g.engine || '',
+    developer: g.creator || '',
+    publisher: g.publisher || '',
+    release_date: formatRecordDateInput(g),
+    status: g.status || '',
+    tags: (g.tags || g.f95_tags || '').replace(/,/g, ' , '),
+    description: g.overview || '',
+    category: g.category || '',
+    latest_version: g.latestVersion || '',
+    censored: g.censored || '',
+    language: g.language || '',
+    translations: g.translations || '',
+    genre: g.genre || '',
+    voice: g.voice || '',
+    rating: g.rating || '',
+    notes: g.notes || '',
+  }
+}
+
+// Maps a RecordTab form field to the key updateGame() expects. Anything absent
+// from this map (e.g. the read-only "mappings" summary) is never sent.
+//
+// title / engine / developer are real `games` columns; everything else lands in
+// game_metadata_overrides. Note description -> overview: the override column is
+// deliberately separate from games.description so that reverting a custom
+// description can fall back to the source text.
+const FORM_TO_PAYLOAD = {
+  title: 'title',
+  engine: 'engine',
+  developer: 'creator',
+  platform: 'os',
+  publisher: 'publisher',
+  release_date: 'release_date',
+  status: 'status',
+  category: 'category',
+  latest_version: 'latest_version',
+  censored: 'censored',
+  language: 'language',
+  translations: 'translations',
+  genre: 'genre',
+  voice: 'voice',
+  rating: 'rating',
+  description: 'overview',
+  // A real games column, not an override — see the migration in db/index.js.
+  notes: 'notes',
+}
+
+// Builds the sparse updateGame payload: only the fields whose value actually
+// differs from what the form was seeded with.
+//
+// This is the fix for overrides leaking across fields. The form is seeded from
+// the MERGED record (Atlas/Steam/GOG values already resolved), so sending the
+// whole form made every displayed value a user override — one edit pinned all
+// thirteen metadata fields, and the pinned latest_version froze update
+// detection. Sending only genuine edits means an override is created for
+// exactly the field the user touched.
+//
+// A field the user has emptied is still "changed", and is sent as '' — the DB
+// layer reads that as "clear this override" and restores the source value.
+function buildChangedPayload(current, baseline) {
+  const payload = {}
+  for (const [formKey, payloadKey] of Object.entries(FORM_TO_PAYLOAD)) {
+    const next = current?.[formKey] ?? ''
+    const prev = baseline?.[formKey] ?? ''
+    if (String(next) !== String(prev)) payload[payloadKey] = next
+  }
+  // Tags round-trip through a " , " separated display form; only send them if
+  // the user actually altered the field (it is read-only for now).
+  const nextTags = current?.tags ?? ''
+  if (String(nextTags) !== String(baseline?.tags ?? '')) {
+    const normalized = nextTags ? nextTags.replace(/ , /g, ',') : ''
+    payload.tags = normalized
+    payload.f95_tags = normalized
+  }
+  return payload
+}
+
+function versionToData(v) {
+  const hasSize = v.folder_size !== undefined && v.folder_size !== null && v.folder_size !== ''
+  const lastPlayed = formatVersionDate(v.last_played, 'Never')
+  const dateAdded = formatVersionDate(v.date_added, 'Unknown')
+  return {
+    game_version: v.version || '',
+    game_path: v.game_path || '',
+    executable: v.exec_path || '',
+    last_played: lastPlayed.display,
+    last_played_title: lastPlayed.absolute || lastPlayed.display,
+    playtime: v.version_playtime?.toString() || '',
+    version_size: v.isInstalled === false
+      ? 'Missing path'
+      : hasSize
+        ? formatBytes(v.folder_size)
+        : 'Unknown',
+    date_added: dateAdded.display,
+    date_added_title: dateAdded.absolute || dateAdded.display,
+  }
+}
+
+const GameDetailWindow = () => {
+  const [game, setGame] = useState(null)
+  const [versions, setVersions] = useState([])
+  const [selectedVersion, setSelectedVersion] = useState(null)
+  const [formData, setFormData] = useState(EMPTY_FORM)
+  // Tags save on change rather than through the window's Save button, so they
+  // live outside formData entirely.
+  const tagState = useTagState(game?.record_id)
+  // The values the form was seeded with, so a save can send only real edits
+  // (see buildChangedPayload).
+  const [baselineForm, setBaselineForm] = useState(EMPTY_FORM)
+  // Per-field custom-value report from get-game-overrides: which fields the
+  // user has overridden and what each would inherit if cleared.
+  const [overrides, setOverrides] = useState(null)
+  const [versionData, setVersionData] = useState(EMPTY_VERSION)
+  const [bannerUrl, setBannerUrl] = useState('')
+  const [previewUrls, setPreviewUrls] = useState([])
+  const [validPreviewUrls, setValidPreviewUrls] = useState([])
+  const [importProgress, setImportProgress] = useState({ text: '', progress: 0, total: 0 })
+  const [isMaximized, setIsMaximized] = useState(false)
+  const [activeTab, setActiveTab] = useState('Record')
+  const [searchResults, setSearchResults] = useState([])
+  const [showModal, setShowModal] = useState(false)
+  const [addVersionDraft, setAddVersionDraft] = useState(null)
+  const [addVersionBusy, setAddVersionBusy] = useState(false)
+  const [addVersionError, setAddVersionError] = useState('')
+  // Generic confirm/alert dialog (replaces window.confirm / alert). `dialog`
+  // holds the props for ConfirmModal, or null when closed.
+  const [dialog, setDialog] = useState(null)
+  const [dialogBusy, setDialogBusy] = useState(false)
+  // Manual (custom) source-id mapping modal — lets the user set F95 / Steam /
+  // LewdCorner ids directly (see Mappings tab / set-manual-mappings IPC).
+  const [mappingModalOpen, setMappingModalOpen] = useState(false)
+  const [mappingDraft, setMappingDraft] = useState({ f95: '', steam: '', gog: '', lewdcorner: '' })
+  const [mappingBusy, setMappingBusy] = useState(false)
+  const [dataReceived, setDataReceived] = useState(false)
+  const [loadError, setLoadError] = useState(false)
+  const dataHandledRef = useRef(false)
+  const retryLoadRef = useRef(null)
+  const sizeRefreshKeyRef = useRef(new Set())
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  // Show a simple in-app alert modal (single OK button).
+  const showAlert = (title, body) => setDialog({ alert: true, title, body })
+  // Show a confirm modal; onConfirm runs the (async) action, with busy state
+  // and the modal closing on completion.
+  const openConfirm = (opts) => setDialog(opts)
+  const closeDialog = () => { if (!dialogBusy) setDialog(null) }
+  const runDialogAction = async (action) => {
+    setDialogBusy(true)
+    try {
+      await action?.()
+      setDialog(null)
+    } finally {
+      setDialogBusy(false)
+    }
+  }
+
+  // Seeds the form and records the baseline the next save will diff against.
+  const seedForm = (sourceGame) => {
+    const seeded = gameToFormData(sourceGame)
+    setFormData(seeded)
+    setBaselineForm(seeded)
+  }
+
+  const loadOverrides = (recordId) => {
+    if (!recordId || typeof window.electronAPI.getGameOverrides !== 'function') return
+    window.electronAPI.getGameOverrides(recordId)
+      .then((result) => setOverrides(result || null))
+      .catch((err) => console.error('Failed to load custom metadata:', err))
+  }
+
+  const handleVersionSelect = (version, persist = false) => {
+    setSelectedVersion(version)
+    setVersionData(versionToData(version))
+    if (persist && game?.record_id && version?.version_id) {
+      window.electronAPI.setSelectedGameVersion(game.record_id, version.version_id)
+        .then((result) => {
+          if (result?.success === false) {
+            console.error('Failed to save selected version:', result.error)
+          }
+        })
+        .catch((err) => console.error('Failed to save selected version:', err))
+    }
+  }
+
+  const refreshFromGame = (updatedGame, preferredVersion) => {
+    setGame(updatedGame)
+    seedForm(updatedGame)
+    loadOverrides(updatedGame?.record_id)
+    const updatedVersions = updatedGame.versions || []
+    setVersions(updatedVersions)
+    const preferredVersionId = preferredVersion && typeof preferredVersion === 'object'
+      ? preferredVersion.version_id
+      : null
+    const preferredVersionName = preferredVersion && typeof preferredVersion === 'object'
+      ? preferredVersion.version
+      : preferredVersion
+    const versionToSelect =
+      updatedVersions.find((v) =>
+        preferredVersionId
+          ? v.version_id === preferredVersionId
+          : v.version === preferredVersionName
+      ) ||
+      updatedVersions.find((v) =>
+        Number(v.version_id) === Number(updatedGame.selected_version_id)
+      ) ||
+      updatedVersions[0]
+    if (versionToSelect) handleVersionSelect(versionToSelect)
+    else { setSelectedVersion(null); setVersionData(EMPTY_VERSION) }
+  }
+
+  // ── IPC Setup ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const handleGameData = (event, fetchedGame) => {
+      if (dataHandledRef.current) return
+      dataHandledRef.current = true
+      setDataReceived(true)
+      if (!fetchedGame) { setLoadError(true); return }
+      setGame(fetchedGame)
+      setVersions(fetchedGame.versions || [])
+      seedForm(fetchedGame)
+      loadOverrides(fetchedGame.record_id)
+      if (fetchedGame.versions?.length > 0) {
+        handleVersionSelect(
+          fetchedGame.versions.find((version) =>
+            Number(version.version_id) === Number(fetchedGame.selected_version_id)
+          ) || fetchedGame.versions[0],
+        )
+      }
+      recalculateMissingVersionSizes(fetchedGame)
+      setBannerUrl(fetchedGame.banner_url || '')
+      window.electronAPI.getPreviews(fetchedGame.record_id)
+        .then((urls) => setPreviewUrls(urls || []))
+        .catch((err) => console.error('Failed to load previews:', err))
+    }
+
+    const pullGameData = () => {
+      if (typeof window.electronAPI.requestGameData !== 'function') return
+      setLoadError(false)
+      dataHandledRef.current = false
+      window.electronAPI.requestGameData()
+        .then((fetchedGame) => {
+          if (!fetchedGame) { setLoadError(true); return }
+          handleGameData(null, fetchedGame)
+        })
+        .catch((err) => { console.error('requestGameData failed:', err); setLoadError(true) })
+    }
+    retryLoadRef.current = pullGameData
+    pullGameData()
+
+    window.electronAPI.onWindowStateChanged((state) => setIsMaximized(state === 'maximized'))
+
+    const handleImportProgress = (progress) => {
+      setImportProgress(sanitizeProgressState(progress))
+      if (progress.progress >= progress.total && progress.total > 0) {
+        setTimeout(() => setImportProgress({ text: '', progress: 0, total: 0 }), 2000)
+      }
+    }
+    window.electronAPI.onGameDetailsImportProgress(handleImportProgress)
+    return () => window.electronAPI.removeGameDetailsImportProgressListener(handleImportProgress)
+  }, [])
+
+  useEffect(() => {
+    if (!game?.record_id) return
+    const handleGameUpdated = async (event, payload) => {
+      const updatedId = typeof payload === 'object' ? payload?.record_id : payload
+      if (updatedId !== game.record_id) return
+      const updatedGame = typeof payload === 'object'
+        ? payload
+        : await window.electronAPI.getGame(game.record_id)
+      if (updatedGame) refreshFromGame(updatedGame, selectedVersion)
+    }
+    const removeListener = window.electronAPI.onGameUpdated?.(handleGameUpdated)
+    return () => {
+      if (typeof removeListener === 'function') removeListener()
+    }
+  }, [game?.record_id, selectedVersion])
+
+  useEffect(() => {
+    Promise.all(
+      previewUrls.map(async (url) => {
+        try {
+          const img = new Image(); img.src = toMediaSrc(url)
+          await new Promise((res, rej) => { img.onload = res; img.onerror = rej })
+          return url
+        } catch { return null }
+      })
+    ).then((results) => setValidPreviewUrls(results.filter(Boolean)))
+  }, [previewUrls])
+
+  // ── Handlers ─────────────────────────────────────────────────────────────
+  const handleDownloadBanner = async () => {
+    setImportProgress({ text: 'Starting banner download...', progress: 0, total: 1 })
+    try {
+      const newUrl = await window.electronAPI.updateBanners(game.record_id)
+      setBannerUrl(firstMediaUrl(newUrl))
+    } catch (err) {
+      console.error('Failed to download banner:', err)
+      setImportProgress({ text: '', progress: 0, total: 0 })
+    }
+  }
+
+  const handleSelectCustomBanner = async () => {
+    try {
+      const filePath = await window.electronAPI.selectFile()
+      if (!filePath) return
+      setImportProgress({ text: 'Converting and saving banner...', progress: 0, total: 1 })
+      const newUrl = await window.electronAPI.convertAndSaveBanner(game.record_id, filePath)
+      setBannerUrl(firstMediaUrl(newUrl))
+      const refreshedGame = await window.electronAPI.getGame(game.record_id)
+      if (refreshedGame) { refreshFromGame(refreshedGame, selectedVersion?.version); setBannerUrl(refreshedGame.banner_url || firstMediaUrl(newUrl)) }
+      setImportProgress({ text: 'Custom banner saved', progress: 1, total: 1 })
+      setTimeout(() => setImportProgress({ text: '', progress: 0, total: 0 }), 1500)
+    } catch (err) {
+      alert(`Failed to save custom banner: ${err.message}`)
+      setImportProgress({ text: '', progress: 0, total: 0 })
+    }
+  }
+
+  const handleDeleteBanner = async () => {
+    try {
+      setImportProgress({ text: 'Deleting downloaded banner...', progress: 0, total: 1 })
+      await window.electronAPI.deleteBanner(game.record_id)
+      const refreshedGame = await window.electronAPI.getGame(game.record_id)
+      if (refreshedGame) {
+        refreshFromGame(refreshedGame, selectedVersion)
+        setBannerUrl(refreshedGame.banner_url || '')
+      }
+      setImportProgress({ text: 'Banner deleted', progress: 1, total: 1 })
+      setTimeout(() => setImportProgress({ text: '', progress: 0, total: 0 }), 1500)
+    } catch (err) {
+      console.error('Failed to delete banner:', err)
+      alert(`Failed to delete banner: ${err.message || 'Unknown error'}`)
+      setImportProgress({ text: '', progress: 0, total: 0 })
+    }
+  }
+
+  const handleDownloadPreviews = async () => {
+    setImportProgress({ text: 'Starting previews download...', progress: 0, total: 1 })
+    try {
+      const newUrls = await window.electronAPI.updatePreviews(game.record_id)
+      setPreviewUrls(newUrls)
+    } catch (err) {
+      console.error('Failed to download previews:', err)
+      setImportProgress({ text: '', progress: 0, total: 0 })
+    }
+  }
+
+  const handleDeletePreviews = async () => {
+    try {
+      setImportProgress({ text: 'Deleting downloaded previews...', progress: 0, total: 1 })
+      await window.electronAPI.deletePreviews(game.record_id)
+      const [refreshedGame, urls] = await Promise.all([
+        window.electronAPI.getGame(game.record_id),
+        window.electronAPI.getPreviews(game.record_id),
+      ])
+      if (refreshedGame) {
+        refreshFromGame(refreshedGame, selectedVersion)
+        setBannerUrl(refreshedGame.banner_url || '')
+      }
+      setPreviewUrls(Array.isArray(urls) ? urls : [])
+      setImportProgress({ text: 'Previews deleted', progress: 1, total: 1 })
+      setTimeout(() => setImportProgress({ text: '', progress: 0, total: 0 }), 1500)
+    } catch (err) {
+      console.error('Failed to delete previews:', err)
+      alert(`Failed to delete previews: ${err.message || 'Unknown error'}`)
+      setImportProgress({ text: '', progress: 0, total: 0 })
+    }
+  }
+
+  const handleRefreshMetadata = async () => {
+    setImportProgress({ text: 'Refreshing media links...', progress: 0, total: 1 })
+    try {
+      const result = await window.electronAPI.refreshGameMedia(game.record_id)
+      if (result?.success === false) throw new Error(result.error || 'Refresh failed')
+      const refreshedGame = result?.game || await window.electronAPI.getGame(game.record_id)
+      if (refreshedGame) refreshFromGame(refreshedGame, selectedVersion?.version)
+      if (result?.bannerUrl) setBannerUrl(firstMediaUrl(result.bannerUrl))
+      if (Array.isArray(result?.previewUrls)) setPreviewUrls(result.previewUrls)
+    } catch (err) {
+      alert(`Failed to refresh media links: ${err.message}`)
+      setImportProgress({ text: '', progress: 0, total: 0 })
+    }
+  }
+
+  const updateSelectedVersionPath = async (changes) => {
+    if (!selectedVersion) {
+      alert('No version selected.')
+      return
+    }
+    const nextVersion = {
+      ...selectedVersion,
+      version_id: selectedVersion.version_id,
+      previousVersion: selectedVersion.version,
+      version: selectedVersion.version,
+      game_path: Object.prototype.hasOwnProperty.call(changes, 'game_path')
+        ? changes.game_path
+        : selectedVersion.game_path,
+      exec_path: Object.prototype.hasOwnProperty.call(changes, 'exec_path')
+        ? changes.exec_path
+        : selectedVersion.exec_path,
+    }
+    const result = await window.electronAPI.updateVersion(nextVersion, game.record_id)
+    if (result?.success === false) throw new Error(result.error || 'Failed to update version')
+    const refreshedGame = await window.electronAPI.getGame(game.record_id)
+    if (refreshedGame) refreshFromGame(refreshedGame, selectedVersion)
+  }
+
+  const recalculateMissingVersionSizes = async (targetGame) => {
+    const targetVersions = targetGame?.versions || []
+    const versionsToRefresh = targetVersions.filter((version) => {
+      if (!version?.game_path || version.isInstalled === false) return false
+      if (Number(version.folder_size || 0) > 0) return false
+      const key = `${targetGame.record_id}|${version.version}|${version.game_path}`
+      if (sizeRefreshKeyRef.current.has(key)) return false
+      sizeRefreshKeyRef.current.add(key)
+      return true
+    })
+    if (versionsToRefresh.length === 0) return
+    try {
+      for (const version of versionsToRefresh) {
+        await window.electronAPI.recalculateVersionSize?.({
+          recordId: targetGame.record_id,
+          version: version.version,
+          gamePath: version.game_path,
+        })
+      }
+      const refreshedGame = await window.electronAPI.getGame(targetGame.record_id)
+      if (refreshedGame) refreshFromGame(refreshedGame, selectedVersion)
+    } catch (err) {
+      console.error('Failed to recalculate version sizes:', err)
+    }
+  }
+
+  const handleSetTitlePlaystate = async (nextPlaystate) => {
+    if (!game?.record_id) return
+    try {
+      const result = await window.electronAPI.setGamePlaystate?.(game.record_id, nextPlaystate)
+      if (result?.success === false) throw new Error(result.error || 'Playstate update failed')
+    } catch (err) {
+      console.error('Failed to update title playstate:', err)
+    }
+  }
+
+  const handleSetVersionPlaystate = async (versionId, nextPlaystate) => {
+    if (!game?.record_id || !versionId) return
+    try {
+      const result = await window.electronAPI.setVersionPlaystate?.(game.record_id, versionId, nextPlaystate)
+      if (result?.success === false) throw new Error(result.error || 'Version playstate update failed')
+    } catch (err) {
+      console.error('Failed to update version playstate:', err)
+    }
+  }
+
+  const handleSetPath = async () => {
+    try {
+      const selectedPath = await window.electronAPI.selectDirectory()
+      if (!selectedPath) return
+      setVersionData((current) => ({ ...current, game_path: selectedPath }))
+      await updateSelectedVersionPath({ game_path: selectedPath })
+    } catch (err) {
+      console.error('Failed to change game path:', err)
+      alert(`Failed to change game path: ${err.message || 'Unknown error'}`)
+    }
+  }
+
+  const handleOpenGamePath = async () => {
+    if (!versionData.game_path) {
+      alert('No game folder is set for this version.')
+      return
+    }
+    try {
+      await window.electronAPI.openDirectory(versionData.game_path)
+    } catch (err) {
+      console.error('Failed to open game folder:', err)
+      alert(`Failed to open game folder: ${err.message || 'Unknown error'}`)
+    }
+  }
+
+  const handleRefreshVersionSize = async () => {
+    if (!selectedVersion?.game_path) {
+      alert('No game path is set for this version.')
+      return
+    }
+    setVersionData((current) => ({ ...current, version_size: 'Calculating...' }))
+    try {
+      const result = await window.electronAPI.recalculateVersionSize?.({
+        recordId: game.record_id,
+        version: selectedVersion.version,
+        gamePath: selectedVersion.game_path,
+      })
+      if (!result?.success) {
+        setVersionData((current) => ({
+          ...current,
+          version_size: result?.missing ? 'Missing path' : 'Unable to calculate',
+        }))
+        return
+      }
+      const refreshedGame = await window.electronAPI.getGame(game.record_id)
+      if (refreshedGame) refreshFromGame(refreshedGame, selectedVersion)
+    } catch (err) {
+      console.error('Failed to refresh version size:', err)
+      setVersionData((current) => ({ ...current, version_size: 'Unable to calculate' }))
+    }
+  }
+
+  const handleChangeExecutable = async () => {
+    try {
+      const selectedPath = await window.electronAPI.selectFile()
+      if (!selectedPath) return
+      setVersionData((current) => ({ ...current, executable: selectedPath }))
+      await updateSelectedVersionPath({ exec_path: selectedPath })
+    } catch (err) {
+      console.error('Failed to change executable:', err)
+      alert(`Failed to change executable: ${err.message || 'Unknown error'}`)
+    }
+  }
+
+  const handleAddVersion = () => {
+    // Open the modal first (task: Add should be a modal), then let the user
+    // choose the source from within it — rather than jumping straight to the
+    // OS file picker before any modal appears.
+    setAddVersionDraft({ sourcePath: '', version: '' })
+    setAddVersionError('')
+  }
+
+  const chooseAddVersionSource = async () => {
+    try {
+      const sourcePath = await window.electronAPI.selectCatalogImportSource?.()
+      if (!sourcePath) return
+      const suggestedVersion = String(sourcePath).split(/[\\/]/).filter(Boolean).pop()?.replace(/\.(zip|7z|rar)$/i, '') || ''
+      setAddVersionDraft((current) => ({
+        ...current,
+        sourcePath,
+        // Only auto-fill the version name if the user hasn't typed one yet.
+        version: current?.version ? current.version : suggestedVersion,
+      }))
+      setAddVersionError('')
+    } catch (err) {
+      console.error('Failed to choose version source:', err)
+      setAddVersionError(`Failed to choose source: ${err.message || 'Unknown error'}`)
+    }
+  }
+
+  const confirmAddVersion = async () => {
+    if (!addVersionDraft || addVersionBusy) return
+    if (!addVersionDraft.sourcePath) {
+      setAddVersionError('Choose a source file or folder first.')
+      return
+    }
+    const version = String(addVersionDraft.version || '').trim()
+    if (!version) {
+      setAddVersionError('Version name is required.')
+      return
+    }
+    setAddVersionBusy(true)
+    setAddVersionError('')
+    try {
+      const result = await window.electronAPI.importLocalGameVersion?.({
+        recordId: game.record_id,
+        sourcePath: addVersionDraft.sourcePath,
+        version,
+        replaceExisting: false,
+      })
+      if (!result?.success) throw new Error(result?.error || 'Import failed')
+      const refreshedGame = await window.electronAPI.getGame(game.record_id)
+      if (refreshedGame) refreshFromGame(refreshedGame)
+      setAddVersionDraft(null)
+    } catch (err) {
+      console.error('Failed to add version:', err)
+      setAddVersionError(err.message || 'Import failed')
+    } finally {
+      setAddVersionBusy(false)
+    }
+  }
+
+  const handleRemoveVersion = async () => {
+    if (!selectedVersion) { showAlert('No version selected', 'Select a version first.'); return }
+    const versionLabel = selectedVersion.version || 'this version'
+    const currentCount = await window.electronAPI.countVersions(game.record_id)
+    if (currentCount <= 1) {
+      openConfirm({
+        title: 'Remove from library',
+        body: `Remove "${game.title}" from the local library?\n\nThis is the last version. Game files will be kept on disk.`,
+        confirmLabel: 'Remove',
+        tone: 'danger',
+        onConfirm: () => runDialogAction(async () => {
+          const dbResult = await window.electronAPI.deleteGameCompletely(game.record_id)
+          if (!dbResult.success) { showAlert('Remove failed', dbResult.error || 'Unknown error'); return }
+          window.electronAPI.closeWindow()
+        }),
+      })
+      return
+    }
+    openConfirm({
+      title: 'Remove version',
+      body: `Remove version "${versionLabel}" from the local library?\n\nGame files will be kept on disk.`,
+      confirmLabel: 'Remove',
+      tone: 'danger',
+      onConfirm: () => runDialogAction(async () => {
+        const result = await window.electronAPI.deleteVersion({ recordId: game.record_id, version: selectedVersion.version })
+        if (result.success) {
+          const updatedVersions = versions.filter((v) => v.version !== selectedVersion.version)
+          setVersions(updatedVersions)
+          if (updatedVersions.length > 0) handleVersionSelect(updatedVersions[0])
+          else { setSelectedVersion(null); setVersionData(EMPTY_VERSION) }
+        } else {
+          showAlert('Remove failed', result.error || 'Unknown error')
+        }
+      }),
+    })
+  }
+
+  const handleDeleteVersionFiles = async () => {
+    if (!selectedVersion) { showAlert('No version selected', 'Select a version first.'); return }
+    if (!selectedVersion.game_path) { showAlert('No game folder', 'No game folder is set for this version.'); return }
+    const versionLabel = selectedVersion.version || 'this version'
+    openConfirm({
+      title: 'Delete files from disk',
+      body: `Delete files for version "${versionLabel}" from disk?\n\nThis will delete:\n${selectedVersion.game_path}\n\nThe database entry will remain. This cannot be undone.`,
+      confirmLabel: 'Delete Files',
+      tone: 'danger',
+      onConfirm: () => runDialogAction(async () => {
+        const result = await window.electronAPI.deleteFolderRecursive({ recordId: game.record_id, folderPath: selectedVersion.game_path })
+        if (!result.success) { showAlert('Delete failed', result.error || 'Unknown error'); return }
+        const refreshedGame = await window.electronAPI.getGame(game.record_id)
+        if (refreshedGame) refreshFromGame(refreshedGame, selectedVersion)
+      }),
+    })
+  }
+
+  const handleRemoveTitle = async () => {
+    openConfirm({
+      title: 'Remove title from library',
+      body: `Remove "${game.title}" from the local library?\n\nGame files will be kept on disk.`,
+      confirmLabel: 'Remove Title',
+      tone: 'danger',
+      onConfirm: () => runDialogAction(async () => {
+        const result = await window.electronAPI.deleteTitle({ recordId: game.record_id, deleteFiles: false })
+        if (!result.success) { showAlert('Remove failed', result.error || 'Unknown error'); return }
+        window.electronAPI.closeWindow()
+      }),
+    })
+  }
+
+  const handleDeleteTitleAndFiles = async () => {
+    const versionPaths = (game.versions || []).map((v) => v.game_path).filter(Boolean)
+    const pathList = versionPaths.length ? `\n\nFolders to delete:\n${versionPaths.join('\n')}` : '\n\nNo linked folders found.'
+    openConfirm({
+      title: 'Delete title and files',
+      body: `Delete "${game.title}" and all linked files from disk?${pathList}\n\nThis cannot be undone.`,
+      confirmLabel: 'Delete Everything',
+      tone: 'danger',
+      onConfirm: () => runDialogAction(async () => {
+        const result = await window.electronAPI.deleteTitle({ recordId: game.record_id, deleteFiles: true })
+        if (!result.success) { showAlert('Delete failed', result.error || 'Unknown error'); return }
+        window.electronAPI.closeWindow()
+      }),
+    })
+  }
+
+  const handleSave = async () => {
+    // Send ONLY the fields the user actually changed. Sending the whole form
+    // would write every displayed (merged) value into the overrides table.
+    const changed = buildChangedPayload(formData, baselineForm)
+    if (Object.keys(changed).length > 0) {
+      await window.electronAPI.updateGame({ record_id: game.record_id, ...changed })
+    }
+    const savedVersion = {
+      version_id: selectedVersion?.version_id,
+      version: versionData.game_version,
+    }
+    if (selectedVersion) {
+      const result = await window.electronAPI.updateVersion({
+        ...selectedVersion,
+        version_id: selectedVersion.version_id,
+        previousVersion: selectedVersion.version,
+        version: versionData.game_version,
+        game_path: versionData.game_path,
+        exec_path: versionData.executable,
+      }, game.record_id)
+      if (result?.success === false) {
+        alert(result.error || 'Failed to update version')
+        return
+      }
+    }
+    const refreshedGame = await window.electronAPI.getGame(game.record_id)
+    if (refreshedGame) refreshFromGame(refreshedGame, savedVersion)
+  }
+
+  // Drops the custom value for one field so it falls back to its source value.
+  const handleRevertField = (formKey) => {
+    if (!game?.record_id) return
+    const field = overrides?.fields?.find((f) => f.formKey === formKey)
+    if (!field?.overridden) return
+    if (field.resettable === false) {
+      showAlert(`Cannot reset ${field.label}`, `No source value is available for ${field.label.toLowerCase()}, so there is nothing to reset it to.`)
+      return
+    }
+
+    // Confirm first — discarding a custom value the user typed is not
+    // recoverable, and the reset icons sit close enough to the inputs to be
+    // hit by accident. Naming both values makes the outcome unambiguous.
+    //
+    // Values are clipped because Description can hold a full synopsis, which
+    // would otherwise push the dialog buttons off screen.
+    const clip = (text, max = 160) => {
+      const value = String(text ?? '').replace(/\s+/g, ' ').trim()
+      return value.length > max ? `${value.slice(0, max).trimEnd()}…` : value
+    }
+    // Title/Engine/Developer are base games columns with no override row, so a
+    // reset overwrites the stored value with the source value rather than
+    // clearing an override. Say that plainly instead of calling it "custom".
+    const sourceLine = field.inherited
+      ? field.inheritedFrom === 'original'
+        // The revert target is what the field held before the edit, which is not
+        // necessarily what the sources say now.
+        ? `It will go back to what it was before you changed it:\n"${clip(field.inherited)}"`
+        : `It will be replaced with the value from Atlas, Steam or GOG:\n"${clip(field.inherited)}"`
+      : field.base
+        ? 'There is nothing recorded to reset this field to.'
+        : 'There is no source value for this field, so it will be left empty.'
+    const lead = field.base
+      ? `Replace the ${field.label.toLowerCase()} stored for "${game.title}"?`
+      : `Discard your custom ${field.label.toLowerCase()} for "${game.title}"?`
+    openConfirm({
+      title: `Reset ${field.label}?`,
+      body: `${lead}\n\nCurrent value:\n"${clip(field.custom)}"\n\n${sourceLine}`,
+      confirmLabel: `Reset ${field.label}`,
+      tone: 'danger',
+      onConfirm: () => runDialogAction(async () => {
+        try {
+          const result = await window.electronAPI.clearGameOverrides(game.record_id, [field.column])
+          if (result?.success === false) { showAlert('Reset failed', result.error || 'Unknown error'); return }
+          const refreshedGame = await window.electronAPI.getGame(game.record_id)
+          if (refreshedGame) refreshFromGame(refreshedGame, selectedVersion)
+        } catch (err) {
+          showAlert('Reset failed', err.message || 'Unknown error')
+        }
+      }),
+    })
+  }
+
+  // Drops every custom value for the title, restoring Atlas/Steam/GOG data.
+  const handleClearAllOverrides = () => {
+    if (!game?.record_id) return
+    // Only fields that can actually be reset are offered. A base column with no
+    // source value (an unmatched record) has nothing to fall back to.
+    const resettable = (overrides?.fields || []).filter((f) => f.overridden && f.resettable !== false)
+    const count = resettable.length
+    if (count === 0) { showAlert('Nothing to reset', 'This title has no changed fields that can be reset to source values.'); return }
+    const names = resettable.map((f) => f.label).join(', ')
+    openConfirm({
+      title: 'Reset all fields',
+      body: `Reset every changed field for "${game.title}"?\n\n${count} field${count === 1 ? '' : 's'}: ${names}\n\nEach one goes back to the value from Atlas, Steam or GOG. Versions, media and playtime are not affected.`,
+      confirmLabel: 'Reset All Fields',
+      tone: 'danger',
+      onConfirm: () => runDialogAction(async () => {
+        const result = await window.electronAPI.clearGameOverrides(game.record_id, null)
+        if (result?.success === false) { showAlert('Clear failed', result.error || 'Unknown error'); return }
+        const refreshedGame = await window.electronAPI.getGame(game.record_id)
+        if (refreshedGame) refreshFromGame(refreshedGame, selectedVersion)
+      }),
+    })
+  }
+
+  const handleFindGame = async () => {
+    try {
+      const results = await window.electronAPI.searchAtlas(formData.title, formData.developer)
+      setSearchResults(results || [])
+      setShowModal(true)
+    } catch (err) { console.error('Failed to search Atlas:', err) }
+  }
+
+  const handleSelectGame = async (atlasId) => {
+    try {
+      await window.electronAPI.addAtlasMapping(game.record_id, atlasId)
+      const updatedGame = await window.electronAPI.getGame(game.record_id)
+      refreshFromGame(updatedGame, selectedVersion)
+      setBannerUrl(updatedGame.banner_url || '')
+      window.electronAPI.getPreviews(updatedGame.record_id)
+        .then((urls) => setPreviewUrls(urls || []))
+        .catch(console.error)
+      setShowModal(false)
+    } catch (err) { console.error('Failed to update Atlas mapping:', err) }
+  }
+
+  // Open the manual-mapping modal, seeded with any existing manual ids the
+  // user set previously (falls back to empty). Custom F95 / Steam / LewdCorner
+  // ids are stored via set-manual-mappings and merged into the Mappings tab.
+  const openMappingModal = async () => {
+    let existing = {}
+    try {
+      const result = await window.electronAPI.getManualMappings?.(game.record_id)
+      if (result?.success !== false) existing = result?.mappings || result || {}
+    } catch (err) { console.error('Failed to load manual mappings:', err) }
+    setMappingDraft({
+      f95: String(existing.f95_id ?? existing.f95 ?? ''),
+      steam: String(existing.steam_appid ?? existing.steam_id ?? existing.steam ?? ''),
+      gog: String(existing.gog_id ?? existing.gog_appid ?? existing.gog ?? ''),
+      lewdcorner: String(existing.lc_id ?? existing.lewdcorner_id ?? existing.lewdcorner ?? ''),
+    })
+    setMappingModalOpen(true)
+  }
+
+  const saveManualMappings = async () => {
+    setMappingBusy(true)
+    try {
+      const mappings = {
+        f95_id: mappingDraft.f95,
+        steam_appid: mappingDraft.steam,
+        gog_id: mappingDraft.gog,
+        lc_id: mappingDraft.lewdcorner,
+      }
+      const result = await window.electronAPI.setManualMappings?.(game.record_id, mappings)
+      if (result?.success === false) { showAlert('Save failed', result.error || 'Unknown error'); return }
+      const updatedGame = await window.electronAPI.getGame(game.record_id)
+      if (updatedGame) refreshFromGame(updatedGame, selectedVersion)
+      setMappingModalOpen(false)
+    } catch (err) {
+      console.error('Failed to save manual mappings:', err)
+      showAlert('Save failed', err.message || 'Unknown error')
+    } finally {
+      setMappingBusy(false)
+    }
+  }
+
+  // ── Derived state ─────────────────────────────────────────────────────────
+  const bannerMediaStatus = bannerUrl
+    ? isRemoteMediaUrl(bannerUrl) ? 'Streaming from the web' : 'Downloaded to local storage'
+    : 'No banner available'
+  const previewMediaStatus = validPreviewUrls.length > 0
+    ? validPreviewUrls.some(isRemoteMediaUrl) ? 'Streaming from the web' : 'Downloaded to local storage'
+    : 'No previews available'
+
+  // ── Loading state ─────────────────────────────────────────────────────────
+  if (!game) {
+    return (
+      <div className="flex flex-col h-screen bg-canvas text-text overflow-hidden">
+        <WindowTitleBar title="Edit Game Details" isMaximized={isMaximized} />
+        <div className="flex-grow flex flex-col items-center justify-center bg-secondary gap-4">
+          {loadError ? (
+            <>
+              <span className="text-text">Couldn't load this game's data.</span>
+              <button onClick={() => retryLoadRef.current?.()} className="px-4 py-2 bg-accent text-white rounded hover:bg-accentHover" style={{ pointerEvents: 'auto' }}>Retry</button>
+            </>
+          ) : (
+            <span>Loading game data...</span>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // ── Main render ───────────────────────────────────────────────────────────
+  return (
+    <div className="flex flex-col h-screen bg-canvas text-text overflow-hidden">
+      {/* Native OS chrome (see electron/main.js — titleBarStyle: 'hidden'):
+          OS draws the frame, corners, shadow and resize border. */}
+      <WindowTitleBar title="Edit Game Details" isMaximized={isMaximized} />
+
+      <div className="flex flex-col flex-1 min-h-0 bg-primary">
+        <div className="flex shrink-0 border-b border-border items-center justify-between">
+          <div className="flex flex-wrap">
+            {['Record', 'Versions', 'Media', 'Mappings'].map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={`px-4 py-2 ${activeTab === tab ? 'bg-secondary border-t border-l border-r border-border' : 'bg-primary'}`}
+              >
+                {tab}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={handleFindGame}
+            className="mx-3 my-2 px-4 py-2 bg-accent text-white rounded hover:bg-accentHover text-sm whitespace-nowrap shrink-0"
+          >
+            <i className="fas fa-magnifying-glass mr-2" aria-hidden="true"></i>
+            Find Match
+          </button>
+        </div>
+
+        <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
+          <div className="flex-1 min-h-0 overflow-y-auto p-4 bg-secondary pb-24 scroll-window-inset">
+            {activeTab === 'Record' && (
+              <RecordTab
+                formData={formData}
+                overrides={overrides}
+                onChange={(e) => setFormData({ ...formData, [e.target.name]: e.target.value })}
+                onRevertField={handleRevertField}
+                onClearAllOverrides={handleClearAllOverrides}
+                tagState={tagState}
+              />
+            )}
+            {activeTab === 'Versions' && (
+              <VersionsTab
+                versions={versions}
+                selectedVersion={selectedVersion}
+                versionData={versionData}
+                onVersionSelect={(version) => handleVersionSelect(version, true)}
+                onVersionInputChange={(e) => setVersionData({ ...versionData, [e.target.name]: e.target.value })}
+                onSetPath={handleSetPath}
+                onOpenGamePath={handleOpenGamePath}
+                onRefreshVersionSize={handleRefreshVersionSize}
+                onChangeExecutable={handleChangeExecutable}
+                onAddVersion={handleAddVersion}
+                onRemoveVersion={handleRemoveVersion}
+                onDeleteVersionFiles={handleDeleteVersionFiles}
+                titlePlaystate={effectiveTitlePlaystate(game?.playstate, versions)}
+                titlePlaystateIsDerived={!game?.playstate}
+                onSetTitlePlaystate={handleSetTitlePlaystate}
+                onSetVersionPlaystate={handleSetVersionPlaystate}
+              />
+            )}
+            {activeTab === 'Media' && (
+              <MediaTab
+                game={game}
+                bannerUrl={bannerUrl}
+                bannerMediaStatus={bannerMediaStatus}
+                validPreviewUrls={validPreviewUrls}
+                previewMediaStatus={previewMediaStatus}
+                importProgress={importProgress}
+                onDownloadBanner={handleDownloadBanner}
+                onSelectCustomBanner={handleSelectCustomBanner}
+                onDeleteBanner={handleDeleteBanner}
+                onDownloadPreviews={handleDownloadPreviews}
+                onDeletePreviews={handleDeletePreviews}
+                onRefreshMetadata={handleRefreshMetadata}
+              />
+            )}
+            {activeTab === 'Mappings' && (
+              <MappingsTab
+                game={game}
+                onAddMapping={openMappingModal}
+              />
+            )}
+          </div>
+        </div>
+
+        <div className="shrink-0 p-4 bg-primary flex items-center justify-between z-10 border-t border-border">
+          <div className="flex gap-2">
+            <button onClick={handleRemoveTitle} className="px-4 py-1 bg-danger hover:bg-dangerHover text-white rounded">
+              Remove Title
+            </button>
+            <button onClick={handleDeleteTitleAndFiles} className="px-4 py-1 bg-dangerStrong hover:bg-danger text-white rounded">
+              Delete Title
+            </button>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={handleSave} className="px-4 py-1 bg-button hover:bg-buttonHover rounded">Save</button>
+            <button onClick={() => window.electronAPI.closeWindow()} className="px-4 py-1 bg-button hover:bg-buttonHover rounded">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      {showModal && (
+        <div
+          className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4"
+          onClick={() => { setShowModal(false); setSearchResults([]) }}
+        >
+          <div className="bg-secondary p-4 rounded-md max-w-lg w-full" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg mb-4">Select Game Match</h2>
+            {searchResults.length > 0 ? (
+              <ul className="space-y-2 max-h-[300px] overflow-y-auto">
+                {searchResults.map((result, index) => (
+                  <li
+                    key={index}
+                    className="p-2 bg-button hover:bg-buttonHover rounded cursor-pointer"
+                    onClick={() => handleSelectGame(result.atlas_id)}
+                  >
+                    <div>{result.title}</div>
+                    <div className="text-sm text-muted">
+                      Atlas ID: {result.atlas_id} | F95 ID: {result.f95_id || 'N/A'} | Creator: {result.creator || 'N/A'}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>No matches found</p>
+            )}
+            <div className="flex justify-end space-x-2 mt-4">
+              <button
+                onClick={() => { setShowModal(false); setSearchResults([]) }}
+                className="px-4 py-1 bg-button hover:bg-buttonHover rounded"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {addVersionDraft && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-secondary border border-border p-4 rounded-md max-w-lg w-full">
+            <h2 className="text-lg font-semibold mb-3">Add Version</h2>
+            <label className="block text-sm mb-3">
+              <span className="block mb-1">Source</span>
+              <div className="flex items-center gap-2">
+                <div className="flex-grow bg-primary border border-border p-2 break-all text-muted min-h-[38px]">
+                  {addVersionDraft.sourcePath || 'No source selected'}
+                </div>
+                <button
+                  onClick={chooseAddVersionSource}
+                  disabled={addVersionBusy}
+                  className="px-3 py-2 bg-button hover:bg-buttonHover rounded whitespace-nowrap disabled:opacity-50"
+                >
+                  {addVersionDraft.sourcePath ? 'Change' : 'Choose...'}
+                </button>
+              </div>
+            </label>
+            <label className="block text-sm">
+              <span className="block mb-1">Version name</span>
+              <input
+                autoFocus
+                value={addVersionDraft.version}
+                onChange={(event) => setAddVersionDraft((current) => ({ ...current, version: event.target.value }))}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') confirmAddVersion()
+                  if (event.key === 'Escape' && !addVersionBusy) setAddVersionDraft(null)
+                }}
+                disabled={addVersionBusy}
+                className="w-full bg-primary border border-border p-2"
+              />
+            </label>
+            {addVersionError && <div className="text-danger text-sm mt-2">{addVersionError}</div>}
+            <div className="flex justify-end gap-2 mt-4">
+              <button
+                onClick={() => setAddVersionDraft(null)}
+                disabled={addVersionBusy}
+                className="px-4 py-2 bg-button hover:bg-buttonHover rounded disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmAddVersion}
+                disabled={addVersionBusy || !addVersionDraft.sourcePath || !String(addVersionDraft.version || '').trim()}
+                className="px-4 py-2 bg-accent hover:bg-accentHover text-white rounded disabled:opacity-50"
+              >
+                {addVersionBusy ? 'Importing...' : 'Import'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      <ConfirmModal
+        open={!!dialog}
+        title={dialog?.title}
+        body={dialog?.body}
+        confirmLabel={dialog?.confirmLabel}
+        cancelLabel={dialog?.cancelLabel}
+        tone={dialog?.tone}
+        alert={dialog?.alert}
+        busy={dialogBusy}
+        onConfirm={dialog?.onConfirm}
+        onCancel={closeDialog}
+      />
+
+      {mappingModalOpen && (
+        <div
+          className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[60] p-4"
+          onClick={() => { if (!mappingBusy) setMappingModalOpen(false) }}
+        >
+          <div className="bg-secondary border border-border rounded-md max-w-lg w-full p-4 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold mb-1">Add / Edit Mapping</h2>
+            <p className="text-xs text-muted mb-3">
+              Set source IDs manually. Leave a field blank to remove that mapping. To match against the Atlas database instead, use Find Match.
+            </p>
+            <div className="space-y-3">
+              <label className="block text-sm">
+                <span className="block mb-1">F95Zone ID</span>
+                <input
+                  value={mappingDraft.f95}
+                  onChange={(e) => setMappingDraft((d) => ({ ...d, f95: e.target.value }))}
+                  disabled={mappingBusy}
+                  placeholder="e.g. 12345"
+                  className="w-full bg-primary border border-border p-2 rounded"
+                />
+              </label>
+              <label className="block text-sm">
+                <span className="block mb-1">Steam App ID</span>
+                <input
+                  value={mappingDraft.steam}
+                  onChange={(e) => setMappingDraft((d) => ({ ...d, steam: e.target.value }))}
+                  disabled={mappingBusy}
+                  placeholder="e.g. 730"
+                  className="w-full bg-primary border border-border p-2 rounded"
+                />
+              </label>
+              <label className="block text-sm">
+                <span className="block mb-1">GOG ID</span>
+                <input
+                  value={mappingDraft.gog}
+                  onChange={(e) => setMappingDraft((d) => ({ ...d, gog: e.target.value }))}
+                  disabled={mappingBusy}
+                  placeholder="e.g. 1435829353"
+                  className="w-full bg-primary border border-border p-2 rounded"
+                />
+              </label>
+              <label className="block text-sm">
+                <span className="block mb-1">LewdCorner ID</span>
+                <input
+                  value={mappingDraft.lewdcorner}
+                  onChange={(e) => setMappingDraft((d) => ({ ...d, lewdcorner: e.target.value }))}
+                  disabled={mappingBusy}
+                  placeholder="e.g. 6789"
+                  className="w-full bg-primary border border-border p-2 rounded"
+                />
+              </label>
+            </div>
+            <div className="flex justify-end gap-2 mt-4">
+              <button
+                onClick={() => setMappingModalOpen(false)}
+                disabled={mappingBusy}
+                className="px-4 py-1.5 bg-button hover:bg-buttonHover rounded disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveManualMappings}
+                disabled={mappingBusy}
+                className="px-4 py-1.5 bg-accent hover:bg-accentHover text-white rounded disabled:opacity-50"
+              >
+                {mappingBusy ? 'Saving...' : 'Save Mapping'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default GameDetailWindow

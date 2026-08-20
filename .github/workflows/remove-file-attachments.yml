@@ -1,0 +1,44 @@
+name: Allow Images Only in Issues
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+# ⬇️ ADD THIS PERMISSIONS BLOCK ⬇️
+permissions:
+  issues: write
+  pull-requests: write # Required if issues and PR comments overlap
+
+jobs:
+  filter-attachments:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Filter Out Non-Image Files
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.comment ? context.payload.comment.body : context.payload.issue.body;
+            if (!body) return;
+
+            const fileAttachmentRegex = /(?<!\!)[\[].*?[\]]\(https:\/\/github\.com\/([^)]*?\/assets\/|user-attachments\/)[^)]+\)/gi;
+
+            if (fileAttachmentRegex.test(body)) {
+              const cleanedBody = body.replace(fileAttachmentRegex, '\n\n⚠️ **[Non-Image Attachment Blocked] Only image files (.png, .jpg, .gif) are allowed here.**\n\n');
+              
+              if (context.payload.comment) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: context.payload.comment.id,
+                  body: cleanedBody
+                });
+              } else {
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.issue.number,
+                  body: cleanedBody
+                });
+              }
+            }

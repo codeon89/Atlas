@@ -1,0 +1,1203 @@
+import { useState, useEffect, useRef } from 'react'
+import BannerLayoutEditor from './bannerEditor/BannerLayoutEditor.jsx'
+import BannerEditorPreview from './bannerEditor/BannerEditorPreview.jsx'
+import ScreenColorPicker from './bannerEditor/ScreenColorPicker.jsx'
+import { defaultBannerLayouts, getBuiltInBannerLayoutOptions } from '../library/bannerLayout/defaultBannerLayouts.js'
+import {
+  BANNER_PRESET_EXPORT_TYPE,
+  BANNER_FIELD_CATEGORIES,
+  BANNER_FIELD_REGISTRY,
+  BANNER_SIZE_LIMITS,
+  BANNER_SIZE_PRESETS,
+  CUSTOM_BANNER_LAYOUT_ID,
+  SUPPORTED_BANNER_FIELD_IDS,
+  SUPPORTED_BANNER_SLOTS,
+  createBannerPresetExport,
+  createUserPresetFromLayout,
+  getBannerLayoutById,
+  normalizeBannerLayout,
+  normalizeBannerLayoutId,
+  normalizeBannerPreset,
+  sanitizeBannerPresetName,
+} from '../library/bannerLayout/bannerLayoutSchema.js'
+import { BROWSE_MODE_ENABLED } from '../../features.js'
+
+const FIELD_LABELS = Object.fromEntries(BANNER_FIELD_REGISTRY.map((field) => [field.id, field.label]))
+
+const SLOT_LABELS = {
+  'top-left': 'Top Left',
+  'top-center': 'Top Center',
+  'top-right': 'Top Right',
+  'center-left': 'Center Left',
+  center: 'Center',
+  'center-right': 'Center Right',
+  'bottom-left': 'Bottom Left',
+  'bottom-center': 'Bottom Center',
+  'bottom-right': 'Bottom Right',
+  'top-left-floating': 'Top Left Floating',
+  'top-right-floating': 'Top Right Floating',
+}
+
+const BADGE_FIELDS = new Set(BANNER_FIELD_REGISTRY.filter((field) => field.supportsBadge).map((field) => field.id))
+
+const previewGame = {
+  record_id: 'banner-preview',
+  title: 'A Very Long Example Title for Layout Preview',
+  creator: 'Studio Example',
+  engine: "Ren'Py",
+  status: 'Completed',
+  latestVersion: 'v1.3.0',
+  versions: [{ version: 'v1.2.0', isInstalled: true }, { version: 'v1.0.0', isInstalled: true }],
+  isUpdateAvailable: false,
+  isFavorite: false,
+  isWishlisted: false,
+  hasInstalledVersion: true,
+  atlas_id: 123,
+  f95_id: 456,
+  steam_id: 789,
+  lc_id: 321,
+  sourceRating: 4.4,
+  views: '2.5M',
+  likes: '888',
+  downloads: '12K',
+  comments: '42',
+  platforms: 'Windows, Mac, Linux',
+  personalRatingOverall: 4.8,
+  totalPlaytime: 9280,
+  thread_updated: Math.floor((Date.now() - 5 * 3600 * 1000) / 1000),
+  lastPlayed: Date.now() - 86400000,
+  tags: 'Female Protagonist, Romance, Mystery, Choices, Animated',
+  category: 'Game',
+  censored: 'No',
+  language: 'English',
+  siteUrl: 'https://example.com',
+}
+
+const previewModes = {
+  local: { label: 'Simple installed sample', patch: {} },
+  favorite: { label: 'Favorite sample', patch: { isFavorite: true } },
+  update: { label: 'Update available sample', patch: { isUpdateAvailable: true } },
+  ...(BROWSE_MODE_ENABLED
+    ? { browse: { label: 'Browse catalog sample', patch: { isCatalogEntry: true, isMetadataOnly: true, hasInstalledVersion: true, isFavorite: false, personalRatingOverall: null, totalPlaytime: 0, lastPlayed: 0 } } }
+    : {}),
+  wishlist: { label: 'Wishlist sample', patch: { isCatalogEntry: true, isWishlistEntry: true, isWishlisted: true } },
+  missing: { label: 'Missing/uninstalled sample', patch: { hasInstalledVersion: false, versions: [], totalPlaytime: 0, lastPlayed: 0 } },
+}
+
+const cloneLayout = (layout) => JSON.parse(JSON.stringify(layout))
+
+const SectionHeader = ({ children }) => (
+  <h3 className="text-sm font-bold uppercase tracking-wide opacity-70 mt-4 mb-2 first:mt-0">{children}</h3>
+)
+
+const uniqueName = (name, presets, ignoreId = null) => {
+  const base = sanitizeBannerPresetName(name)
+  const used = new Set(presets.filter((preset) => preset.id !== ignoreId).map((preset) => preset.name))
+  if (!used.has(base)) return base
+  let index = 2
+  let candidate = `${base} (${index})`
+  while (used.has(candidate)) {
+    index += 1
+    candidate = `${base} (${index})`
+  }
+  return candidate
+}
+
+const BannerEditor = () => {
+  const builtInBannerLayouts = getBuiltInBannerLayoutOptions()
+  const classicLayout = getBannerLayoutById(defaultBannerLayouts, 'classic')
+  const [selectedPresetId, setSelectedPresetId] = useState('classic')
+  const [selectedLayoutId, setSelectedLayoutId] = useState('classic')
+  const [draftLayout, setDraftLayout] = useState(() => cloneLayout(classicLayout))
+  const [userPresets, setUserPresets] = useState([])
+  const [presetName, setPresetName] = useState('')
+  const [statusText, setStatusText] = useState('')
+  const [lockAspectRatio, setLockAspectRatio] = useState(true)
+  const [previewMode, setPreviewMode] = useState('local')
+  const [previewSource, setPreviewSource] = useState('sample')
+  const [liveGame, setLiveGame] = useState(null)
+  const [liveStatus, setLiveStatus] = useState('')
+  const [activeTab, setActiveTab] = useState('layout')
+  // Holds the pending "apply(color)" callback while the cross-screen color
+  // picker overlay is open; null when closed. See pickColorFromScreen.
+  const [screenPickerApply, setScreenPickerApply] = useState(null)
+  const customSaveTimerRef = useRef(null)
+
+  const selectedUserPreset = userPresets.find((preset) => preset.id === selectedPresetId)
+  const selectedBuiltIn = builtInBannerLayouts.find((layout) => layout.id === selectedPresetId)
+  const isUserPresetSelected = Boolean(selectedUserPreset)
+  const syntheticPreviewGame = { ...previewGame, ...(previewModes[previewMode]?.patch || {}) }
+  const activePreviewGame = previewSource === 'sample' ? syntheticPreviewGame : (liveGame || syntheticPreviewGame)
+  const tabs = [
+    { id: 'layout', label: 'Layout' },
+    { id: 'sizeImage', label: 'Size & Image' },
+    { id: 'panels', label: 'Panels' },
+    { id: 'export', label: 'Import / Export' },
+  ]
+
+  const persistUserPresets = async (nextPresets) => {
+    const result = await window.electronAPI.setUserBannerLayouts(nextPresets)
+    if (result?.success === false) throw new Error(result.error || 'Failed to save presets')
+    setUserPresets(nextPresets)
+  }
+
+  const createDraftFromPreset = (presetId) => {
+    const userPreset = userPresets.find((preset) => preset.id === presetId)
+    if (userPreset) return cloneLayout(normalizeBannerPreset(userPreset, classicLayout)?.layout || classicLayout)
+    const preset = getBannerLayoutById(defaultBannerLayouts, presetId)
+    return cloneLayout(normalizeBannerLayout(preset, classicLayout))
+  }
+
+  const markCustom = (updater) => {
+    setDraftLayout((current) => {
+      const next = typeof updater === 'function' ? updater(current) : updater
+      return normalizeBannerLayout(
+        {
+          ...next,
+          id: CUSTOM_BANNER_LAYOUT_ID,
+          name: 'Custom',
+          basePresetId: selectedPresetId,
+        },
+        classicLayout,
+      )
+    })
+    setSelectedLayoutId(CUSTOM_BANNER_LAYOUT_ID)
+    setStatusText('Unsaved custom changes')
+  }
+
+  useEffect(() => {
+    const loadBannerSettings = async () => {
+      try {
+        const [selectedTemplate, customLayout, storedUserPresets] = await Promise.all([
+          window.electronAPI.getSelectedBannerTemplate(),
+          window.electronAPI.getCustomBannerLayout?.(),
+          window.electronAPI.getUserBannerLayouts?.(),
+        ])
+        const existingIds = builtInBannerLayouts.map((layout) => layout.id)
+        const normalizedUserPresets = (Array.isArray(storedUserPresets) ? storedUserPresets : [])
+          .map((preset) => {
+            const normalized = normalizeBannerPreset(preset, classicLayout, existingIds)
+            if (normalized) existingIds.push(normalized.id)
+            return normalized
+          })
+          .filter(Boolean)
+        setUserPresets(normalizedUserPresets)
+
+        const selectedId = normalizeBannerLayoutId(selectedTemplate)
+        const selectedUser = normalizedUserPresets.find((preset) => preset.id === selectedId)
+
+        if (selectedUser) {
+          setSelectedPresetId(selectedUser.id)
+          setSelectedLayoutId(selectedUser.id)
+          setDraftLayout(cloneLayout(selectedUser.layout))
+          setPresetName(selectedUser.name)
+          return
+        }
+
+        if (selectedId === CUSTOM_BANNER_LAYOUT_ID && customLayout) {
+          const normalized = normalizeBannerLayout(customLayout, classicLayout)
+          const basePresetId = normalizeBannerLayoutId(normalized?.basePresetId)
+          setSelectedPresetId(
+            [...builtInBannerLayouts, ...normalizedUserPresets].some((layout) => layout.id === basePresetId)
+              ? basePresetId
+              : 'classic',
+          )
+          setSelectedLayoutId(CUSTOM_BANNER_LAYOUT_ID)
+          setDraftLayout(normalized || cloneLayout(classicLayout))
+          setPresetName(normalized?.name === 'Custom' ? '' : normalized?.name || '')
+          return
+        }
+
+        const safePresetId = builtInBannerLayouts.some((layout) => layout.id === selectedId)
+          ? selectedId
+          : 'classic'
+        const draft = cloneLayout(normalizeBannerLayout(getBannerLayoutById(defaultBannerLayouts, safePresetId), classicLayout))
+        setSelectedPresetId(safePresetId)
+        setSelectedLayoutId(safePresetId)
+        setDraftLayout(draft)
+        setPresetName(draft.name || '')
+      } catch (err) {
+        console.error('Error loading banner layout settings:', err)
+        window.electronAPI.log(`Error loading banner layout settings: ${err.message}`)
+        setDraftLayout(cloneLayout(classicLayout))
+        setSelectedLayoutId('classic')
+        setStatusText('Failed to load banner layout settings')
+      }
+    }
+
+    loadBannerSettings()
+  }, [])
+
+  useEffect(() => {
+    if (selectedLayoutId !== CUSTOM_BANNER_LAYOUT_ID) return undefined
+    if (customSaveTimerRef.current) clearTimeout(customSaveTimerRef.current)
+    customSaveTimerRef.current = setTimeout(async () => {
+      try {
+        const result = await window.electronAPI.setCustomBannerLayout(draftLayout)
+        if (result?.success === false) throw new Error(result.error || 'Save failed')
+      } catch (err) {
+        console.error('Error auto-saving custom banner layout:', err)
+        setStatusText('Failed to save custom draft')
+      }
+    }, 300)
+    return () => {
+      if (customSaveTimerRef.current) clearTimeout(customSaveTimerRef.current)
+    }
+  }, [draftLayout, selectedLayoutId])
+
+  const handlePresetChange = async (presetId) => {
+    const draft = createDraftFromPreset(presetId)
+    setSelectedPresetId(presetId)
+    setSelectedLayoutId(presetId)
+    setDraftLayout(draft)
+    setPresetName(draft.name || '')
+    setStatusText('')
+    try {
+      await window.electronAPI.setSelectedBannerTemplate(presetId)
+    } catch (err) {
+      console.error('Error applying banner preset:', err)
+      setStatusText('Failed to apply banner preset')
+    }
+  }
+
+  const saveCustomDraft = async (layout = draftLayout) => {
+    const normalized = normalizeBannerLayout(
+      {
+        ...layout,
+        id: CUSTOM_BANNER_LAYOUT_ID,
+        name: 'Custom',
+        basePresetId: selectedPresetId,
+      },
+      classicLayout,
+    )
+    const result = await window.electronAPI.setCustomBannerLayout(normalized)
+    if (result?.success === false) throw new Error(result.error || 'Save failed')
+    setDraftLayout(normalized)
+    setSelectedLayoutId(CUSTOM_BANNER_LAYOUT_ID)
+    return normalized
+  }
+
+  const handleSavePreset = async () => {
+    try {
+      const safeName = uniqueName(presetName || draftLayout.name || 'My Layout', userPresets, isUserPresetSelected ? selectedPresetId : null)
+      if (isUserPresetSelected) {
+        const updatedPreset = {
+          ...selectedUserPreset,
+          name: safeName,
+          updatedAt: Date.now(),
+          layout: {
+            ...normalizeBannerLayout(draftLayout, classicLayout),
+            id: selectedUserPreset.id,
+            name: safeName,
+          },
+        }
+        const nextPresets = userPresets.map((preset) =>
+          preset.id === selectedUserPreset.id ? updatedPreset : preset,
+        )
+        await persistUserPresets(nextPresets)
+        await window.electronAPI.setSelectedBannerTemplate(updatedPreset.id)
+        setSelectedPresetId(updatedPreset.id)
+        setSelectedLayoutId(updatedPreset.id)
+        setDraftLayout(cloneLayout(updatedPreset.layout))
+        setPresetName(safeName)
+        setStatusText('Preset saved')
+        return
+      }
+
+      const newPreset = createUserPresetFromLayout(
+        draftLayout,
+        safeName,
+        classicLayout,
+        [...builtInBannerLayouts.map((layout) => layout.id), ...userPresets.map((preset) => preset.id)],
+      )
+      await persistUserPresets([...userPresets, newPreset])
+      await window.electronAPI.setSelectedBannerTemplate(newPreset.id)
+      setSelectedPresetId(newPreset.id)
+      setSelectedLayoutId(newPreset.id)
+      setDraftLayout(cloneLayout(newPreset.layout))
+      setPresetName(newPreset.name)
+      setStatusText('Preset saved')
+    } catch (err) {
+      console.error('Error saving banner preset:', err)
+      setStatusText('Failed to save preset')
+    }
+  }
+
+  const handleDuplicatePreset = async () => {
+    try {
+      const sourceName = presetName || selectedUserPreset?.name || selectedBuiltIn?.name || 'Layout'
+      const duplicateName = uniqueName(`${sourceName} Copy`, userPresets)
+      const duplicate = createUserPresetFromLayout(
+        draftLayout,
+        duplicateName,
+        classicLayout,
+        [...builtInBannerLayouts.map((layout) => layout.id), ...userPresets.map((preset) => preset.id)],
+      )
+      await persistUserPresets([...userPresets, duplicate])
+      await window.electronAPI.setSelectedBannerTemplate(duplicate.id)
+      setSelectedPresetId(duplicate.id)
+      setSelectedLayoutId(duplicate.id)
+      setDraftLayout(cloneLayout(duplicate.layout))
+      setPresetName(duplicate.name)
+      setStatusText('Preset duplicated')
+    } catch (err) {
+      console.error('Error duplicating banner preset:', err)
+      setStatusText('Failed to duplicate preset')
+    }
+  }
+
+  const handleRenamePreset = async () => {
+    if (!isUserPresetSelected) {
+      setStatusText('Cannot rename built-in preset')
+      return
+    }
+    try {
+      const safeName = uniqueName(presetName, userPresets, selectedUserPreset.id)
+      const renamed = {
+        ...selectedUserPreset,
+        name: safeName,
+        updatedAt: Date.now(),
+        layout: { ...selectedUserPreset.layout, name: safeName },
+      }
+      await persistUserPresets(userPresets.map((preset) => preset.id === renamed.id ? renamed : preset))
+      setPresetName(safeName)
+      setDraftLayout(cloneLayout(renamed.layout))
+      setStatusText('Preset renamed')
+    } catch (err) {
+      console.error('Error renaming banner preset:', err)
+      setStatusText('Failed to rename preset')
+    }
+  }
+
+  const handleDeletePreset = async () => {
+    if (!isUserPresetSelected) {
+      setStatusText('Cannot delete built-in preset')
+      return
+    }
+    try {
+      const nextPresets = userPresets.filter((preset) => preset.id !== selectedUserPreset.id)
+      await persistUserPresets(nextPresets)
+      await window.electronAPI.setSelectedBannerTemplate('classic')
+      setSelectedPresetId('classic')
+      setSelectedLayoutId('classic')
+      setDraftLayout(createDraftFromPreset('classic'))
+      setPresetName('Classic')
+      setStatusText('Preset deleted; Classic selected')
+    } catch (err) {
+      console.error('Error deleting banner preset:', err)
+      setStatusText('Failed to delete preset')
+    }
+  }
+
+  const handleExportPreset = async () => {
+    try {
+      const exportData = createBannerPresetExport(
+        isUserPresetSelected ? selectedUserPreset : draftLayout,
+        presetName || draftLayout.name,
+      )
+      const result = await window.electronAPI.exportBannerLayoutPreset(exportData.name, exportData)
+      if (result?.canceled) return
+      if (result?.success === false) throw new Error(result.error || 'Export failed')
+      setStatusText('Preset exported')
+    } catch (err) {
+      console.error('Error exporting banner preset:', err)
+      setStatusText('Failed to export preset')
+    }
+  }
+
+  const handleImportPreset = async () => {
+    try {
+      const result = await window.electronAPI.importBannerLayoutPreset()
+      if (result?.canceled) return
+      if (result?.success === false) {
+        setStatusText('Invalid preset file')
+        return
+      }
+      const data = result.data
+      if (data?.type && data.type !== BANNER_PRESET_EXPORT_TYPE) {
+        setStatusText('Invalid preset file')
+        return
+      }
+      const importedLayout = data?.layout || data
+      const importedName = uniqueName(data?.name || importedLayout?.name || 'Imported Layout', userPresets)
+      const importedPreset = createUserPresetFromLayout(
+        importedLayout,
+        importedName,
+        classicLayout,
+        [...builtInBannerLayouts.map((layout) => layout.id), ...userPresets.map((preset) => preset.id)],
+      )
+      await persistUserPresets([...userPresets, importedPreset])
+      await window.electronAPI.setSelectedBannerTemplate(importedPreset.id)
+      setSelectedPresetId(importedPreset.id)
+      setSelectedLayoutId(importedPreset.id)
+      setDraftLayout(cloneLayout(importedPreset.layout))
+      setPresetName(importedPreset.name)
+      setStatusText('Preset imported')
+    } catch (err) {
+      console.error('Error importing banner preset:', err)
+      setStatusText('Invalid preset file')
+    }
+  }
+
+  const handleResetCustom = async () => {
+    try {
+      const presetDraft = createDraftFromPreset(selectedPresetId)
+      setDraftLayout(presetDraft)
+      await saveCustomDraft(presetDraft)
+      setStatusText('Reset current layout to preset')
+    } catch (err) {
+      console.error('Error resetting banner layout:', err)
+      setStatusText('Failed to reset layout')
+    }
+  }
+
+  const updateOverlay = (position, patch) => {
+    markCustom((current) => ({
+      ...current,
+      overlays: {
+        ...current.overlays,
+        [position]: {
+          ...current.overlays?.[position],
+          ...patch,
+        },
+      },
+    }))
+  }
+
+  // Panels are the colored regions around the image (top/right/bottom/left).
+  // Enabling one and giving it a size makes the banner larger than the image;
+  // fields with a matching region live inside it (see the Fields tab).
+  const enablePanel = (side) => {
+    const existing = draftLayout.panels?.[side]?.size || 0
+    const defaultSize = side === 'left' || side === 'right' ? 150 : 90
+    updatePanel(side, { enabled: true, size: existing > 0 ? existing : defaultSize })
+  }
+
+  const updatePanel = (side, patch) => {
+    markCustom((current) => ({
+      ...current,
+      panels: {
+        ...current.panels,
+        [side]: {
+          enabled: false,
+          size: 0,
+          background: '#0e1116',
+          textColor: '#ffffff',
+          padding: 10,
+          gap: 6,
+          ...current.panels?.[side],
+          ...patch,
+        },
+      },
+    }))
+  }
+
+  // Whole-banner border (width/color) and corner radius.
+  const updateBorder = (patch) => {
+    markCustom((current) => ({
+      ...current,
+      border: { width: 0, color: '#000000', radius: 0, ...current.border, ...patch },
+    }))
+  }
+
+  const updateHoverEffect = (hoverEffect) => markCustom((current) => ({ ...current, hoverEffect }))
+  const updateHoverScale = (hoverScale) => markCustom((current) => ({ ...current, hoverScale }))
+  const updateShadow = (patch) =>
+    markCustom((current) => ({
+      ...current,
+      shadow: { enabled: false, color: 'rgba(0,0,0,0.5)', ...current.shadow, ...patch },
+    }))
+  const updateIconColor = (iconColor) => markCustom((current) => ({ ...current, iconColor }))
+
+  // Per-panel border: width, color, and which sides show it (all, or e.g. just
+  // the top edge between the image and the panel).
+  const updatePanelBorder = (side, patch) => {
+    markCustom((current) => {
+      const panel = current.panels?.[side] || {}
+      return {
+        ...current,
+        panels: {
+          ...current.panels,
+          [side]: {
+            ...panel,
+            border: {
+              width: 0,
+              color: '#000000',
+              top: false,
+              right: false,
+              bottom: false,
+              left: false,
+              ...panel.border,
+              ...patch,
+            },
+          },
+        },
+      }
+    })
+  }
+
+  // Pull a real record (local library or browse catalog) to preview against, so
+  // the layout is validated with actual titles, metadata, and streamed images
+  // (including hover preview cycling). Picks a random entry each time.
+  const loadLiveSample = async (source) => {
+    setLiveStatus('Loading sample...')
+    try {
+      let games = []
+      if (source === 'browse') {
+        // Bound the random offset by the real catalog size so small catalogs
+        // don't land on an empty page.
+        let total = 0
+        try {
+          const count = await window.electronAPI.getCatalogCount?.({})
+          total = typeof count === 'number' ? count : Number(count?.count ?? count?.total ?? 0)
+        } catch { total = 0 }
+        const offset = total > 1 ? Math.floor(Math.random() * total) : 0
+        const result = await window.electronAPI.getCatalogGames?.({ offset, limit: 20 })
+        games = Array.isArray(result) ? result : result?.games || []
+      } else {
+        // getGames returns { games, total }. Ask for the count first, then pull
+        // a small page at a random offset within range — a random offset alone
+        // returns nothing for normal-sized libraries.
+        let total = 0
+        try {
+          const meta = await window.electronAPI.getGames?.(0, 1, {})
+          total = Array.isArray(meta) ? meta.length : Number(meta?.total ?? 0)
+        } catch { total = 0 }
+        const offset = total > 1 ? Math.floor(Math.random() * total) : 0
+        const result = await window.electronAPI.getGames?.(offset, 20, {})
+        games = Array.isArray(result) ? result : result?.games || []
+      }
+      const usable = (games || []).filter(Boolean)
+      if (usable.length === 0) {
+        setLiveGame(null)
+        setLiveStatus(source === 'browse' ? 'No browse entries found' : 'No library games found')
+        return
+      }
+      const picked = usable[Math.floor(Math.random() * usable.length)]
+      setLiveGame(picked)
+      setLiveStatus(`Previewing: ${picked.title || 'Untitled'}`)
+    } catch (err) {
+      console.error('Failed to load live banner sample:', err)
+      setLiveGame(null)
+      setLiveStatus('Failed to load sample')
+    }
+  }
+
+  const handlePreviewSourceChange = (source) => {
+    setPreviewSource(source)
+    if (source === 'sample') {
+      setLiveStatus('')
+      return
+    }
+    loadLiveSample(source)
+  }
+
+  // Sample a color from anywhere on ANY window or monitor. Prefers the custom
+  // cross-screen picker (a full desktop capture the user clicks — works across
+  // windows and displays, unlike the native EyeDropper which is limited to
+  // this window's own content in Electron). Falls back to the native
+  // EyeDropper API if screen capture isn't available.
+  const canCaptureScreens = typeof window !== 'undefined' && typeof window.electronAPI?.captureScreens === 'function'
+  const nativeEyedropperAvailable = typeof window !== 'undefined' && typeof window.EyeDropper === 'function'
+  const eyedropperAvailable = canCaptureScreens || nativeEyedropperAvailable
+  const pickColorFromScreen = async (apply) => {
+    if (canCaptureScreens) {
+      // Store the apply callback and open the overlay; the overlay calls back
+      // with the picked hex (see ScreenColorPicker render below).
+      setScreenPickerApply(() => apply)
+      return
+    }
+    if (nativeEyedropperAvailable) {
+      try {
+        const result = await new window.EyeDropper().open()
+        if (result?.sRGBHex) apply(result.sRGBHex)
+      } catch {
+        // user cancelled — ignore
+      }
+    }
+  }
+
+  const updateField = (fieldId, patch) => {
+    markCustom((current) => ({
+      ...current,
+      fields: current.fields.map((field) =>
+        field.id === fieldId ? { ...field, ...patch } : field,
+      ),
+    }))
+  }
+
+  // Dividers are repeatable, so they're added/removed outright rather than
+  // toggled visible. Drop a new one into the first enabled panel (bottom
+  // preferred), where a full-row line makes sense.
+  const addDivider = () => {
+    const id = `divider-${Date.now().toString(36)}-${Math.floor(Math.random() * 1000)}`
+    markCustom((current) => {
+      const sides = ['bottom', 'top', 'left', 'right']
+      const region = sides.find((side) => current.panels?.[side]?.enabled) || 'bottom'
+      const rows = current.fields.filter((f) => f.region === region).map((f) => f.row || 0)
+      const row = rows.length ? Math.max(...rows) + 1 : 0
+      return {
+        ...current,
+        fields: [
+          ...current.fields,
+          { id, type: 'divider', region, row, order: 0, align: 'left', orientation: 'horizontal', lineColor: '#ffffff', lineSize: 2, visible: true },
+        ],
+      }
+    })
+    return id
+  }
+
+  const removeField = (fieldId) => {
+    markCustom((current) => ({
+      ...current,
+      fields: current.fields.filter((field) => field.id !== fieldId),
+    }))
+  }
+
+  const updateImageFit = (imageFit) => {
+    markCustom((current) => ({
+      ...current,
+      imageFit,
+      image: { ...current.image, fit: imageFit },
+    }))
+  }
+
+  const updateSizePreset = (presetId) => {
+    const sizePreset = BANNER_SIZE_PRESETS.find((preset) => preset.id === presetId)
+    if (!sizePreset) return
+    markCustom((current) => ({
+      ...current,
+      width: sizePreset.width,
+      height: sizePreset.height,
+      density: sizePreset.density,
+    }))
+  }
+
+  const updateDimension = (key, value) => {
+    const numeric = Number(value)
+    if (!Number.isFinite(numeric)) return
+    markCustom((current) => {
+      const next = { ...current, [key]: numeric }
+      if (lockAspectRatio) {
+        const ratio = (current.width || 537) / (current.height || 251)
+        if (key === 'width') next.height = Math.round(numeric / ratio)
+        if (key === 'height') next.width = Math.round(numeric * ratio)
+      }
+      return next
+    })
+  }
+
+  const updateImage = (patch) => {
+    markCustom((current) => ({
+      ...current,
+      image: { ...current.image, ...patch },
+      imageFit: patch.fit || current.imageFit,
+    }))
+  }
+
+  const updateBlurBackground = (patch) => {
+    markCustom((current) => ({
+      ...current,
+      image: {
+        ...current.image,
+        blurBackground: {
+          opacity: 0.6,
+          blur: 20,
+          scale: 1.1,
+          ...current.image?.blurBackground,
+          ...patch,
+        },
+      },
+    }))
+  }
+
+  const updatePreviewCycle = (patch) => {
+    markCustom((current) => ({
+      ...current,
+      previewCycle: {
+        enabled: false,
+        intervalMs: 2000,
+        ...current.previewCycle,
+        ...patch,
+      },
+    }))
+  }
+
+  const resetField = (fieldId) => {
+    const presetDraft = createDraftFromPreset(selectedPresetId)
+    const presetField = presetDraft.fields.find((field) => field.id === fieldId)
+    if (!presetField) return
+    updateField(fieldId, presetField)
+  }
+
+  return (
+    <div className="text-text -webkit-app-region-no-drag flex flex-col flex-1 min-h-0">
+      {/* Fixed header: the preview-sample selector/status row, the live
+          banner preview, and the tabs all stay pinned here and never
+          scroll — only the active tab's own settings content below
+          scrolls. Previously this whole block lived inside the same
+          scrollable container as that content. */}
+      <div className="flex-shrink-0 space-y-4 pb-2">
+        {/* Preset bar (mirrors the theme editor): choose a preset, name it, and
+            save — always visible at the top rather than buried in a tab. */}
+        <div className="flex flex-wrap items-center gap-2 border-b border-border pb-3">
+          <label className="text-sm font-semibold">Preset</label>
+          <select
+            className="bg-secondary border border-border text-text text-sm rounded p-1.5"
+            value={selectedPresetId}
+            onChange={(event) => handlePresetChange(event.target.value)}
+          >
+            <optgroup label="Built-in">
+              {builtInBannerLayouts.map((layout) => (
+                <option key={layout.id} value={layout.id}>{layout.name}</option>
+              ))}
+            </optgroup>
+            {userPresets.length > 0 && (
+              <optgroup label="User">
+                {userPresets.map((preset) => (
+                  <option key={preset.id} value={preset.id}>{preset.name}</option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+          <input
+            type="text"
+            className="bg-secondary border border-border text-text text-sm rounded p-1.5 w-48"
+            value={presetName}
+            placeholder="Preset name"
+            onChange={(event) => setPresetName(event.target.value)}
+          />
+          <button type="button" onClick={handleSavePreset} className="text-sm bg-accent text-white px-3 py-1.5 rounded hover:bg-accentHover">
+            {isUserPresetSelected ? 'Save' : 'Save as new'}
+          </button>
+          <button type="button" onClick={handleDuplicatePreset} className="text-sm bg-button text-text px-3 py-1.5 rounded hover:bg-buttonHover">Duplicate</button>
+          {isUserPresetSelected && (
+            <button type="button" onClick={handleDeletePreset} className="text-sm bg-button text-text px-3 py-1.5 rounded hover:bg-buttonHover">Delete</button>
+          )}
+          <button type="button" onClick={handleResetCustom} title="Reset the current layout back to the selected preset" className="text-sm bg-button text-text px-3 py-1.5 rounded hover:bg-buttonHover">Reset</button>
+          {statusText && <span className="text-xs opacity-70 ml-auto">{statusText}</span>}
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="text-sm font-semibold">Preview data</label>
+            <select
+              className="bg-secondary border border-border text-text rounded p-1"
+              value={previewSource}
+              onChange={(event) => handlePreviewSourceChange(event.target.value)}
+            >
+              <option value="sample">Sample data</option>
+              <option value="library">Random from library</option>
+              {BROWSE_MODE_ENABLED && <option value="browse">Random from browse</option>}
+            </select>
+            {previewSource === 'sample' ? (
+              <select
+                className="bg-secondary border border-border text-text rounded p-1"
+                value={previewMode}
+                onChange={(event) => setPreviewMode(event.target.value)}
+              >
+                {Object.entries(previewModes).map(([id, mode]) => (
+                  <option key={id} value={id}>{mode.label}</option>
+                ))}
+              </select>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => loadLiveSample(previewSource)}
+                  className="text-sm px-3 py-1 rounded-buttonTheme bg-button hover:bg-buttonHover"
+                >
+                  <i className="fas fa-shuffle mr-1.5"></i>Shuffle
+                </button>
+                {liveStatus && <span className="text-xs opacity-70">{liveStatus}</span>}
+              </>
+            )}
+          </div>
+          <span className="text-xs opacity-70">
+            {selectedLayoutId === CUSTOM_BANNER_LAYOUT_ID
+              ? `Editing a custom copy of ${selectedBuiltIn?.name || selectedUserPreset?.name || 'preset'}`
+              : isUserPresetSelected ? `Saved as ${selectedUserPreset.name}` : 'Built-in preset'}
+          </span>
+        </div>
+
+        <div className="flex justify-center overflow-x-auto py-2">
+          <BannerEditorPreview game={activePreviewGame} layout={draftLayout} />
+        </div>
+
+        <div className="flex gap-2 border-b border-border">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveTab(tab.id)}
+              className={`text-xs px-3 py-2 border-b-2 transition-colors -mb-px ${
+                activeTab === tab.id ? 'border-accent text-accent' : 'border-transparent text-muted hover:text-text'
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className={`flex-1 min-h-0 pt-3 ${activeTab === 'layout' ? 'flex flex-col overflow-hidden' : 'overflow-y-auto space-y-4'}`}>
+      
+      {activeTab === 'layout' && (
+        <BannerLayoutEditor
+          layout={draftLayout}
+          fieldLabels={FIELD_LABELS}
+          slotLabels={SLOT_LABELS}
+          badgeFields={BADGE_FIELDS}
+          fieldRegistry={BANNER_FIELD_REGISTRY}
+          fieldCategories={BANNER_FIELD_CATEGORIES}
+          onFieldChange={updateField}
+          onResetField={resetField}
+          onAddDivider={addDivider}
+          onRemoveField={removeField}
+          onEnablePanel={enablePanel}
+          onDisablePanel={(side) => updatePanel(side, { enabled: false })}
+          eyedropperAvailable={eyedropperAvailable}
+          onPickColor={pickColorFromScreen}
+        />
+      )}
+
+      {activeTab === 'sizeImage' && (
+        <section className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          <div className="space-y-3">
+            <SectionHeader>Image size</SectionHeader>
+            <label className="block text-sm">
+              Size preset
+              <select
+                className="mt-1 w-48 bg-secondary border border-border text-text rounded p-1"
+                value={BANNER_SIZE_PRESETS.find((preset) => preset.width === draftLayout.width && preset.height === draftLayout.height)?.id || 'custom'}
+                onChange={(event) => updateSizePreset(event.target.value)}
+              >
+                {BANNER_SIZE_PRESETS.map((preset) => (
+                  <option key={preset.id} value={preset.id}>{preset.name} ({preset.width}x{preset.height})</option>
+                ))}
+                <option value="custom">Custom</option>
+              </select>
+            </label>
+            <div className="grid grid-cols-2 gap-2 max-w-sm">
+              <label className="block text-sm">
+                Width
+                <input type="number" min="1" className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.width || 537} onChange={(event) => updateDimension('width', event.target.value)} />
+              </label>
+              <label className="block text-sm">
+                Height
+                <input type="number" min="1" className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.height || 251} onChange={(event) => updateDimension('height', event.target.value)} />
+              </label>
+            </div>
+            <label className="flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={lockAspectRatio} onChange={(event) => setLockAspectRatio(event.target.checked)} />
+              Lock aspect ratio
+            </label>
+            <p className="text-xs opacity-60">
+              This is the image size only. Enabled panels (Panels tab) grow the banner outward and never shrink the image.
+            </p>
+
+            <SectionHeader>Banner border &amp; radius</SectionHeader>
+            <div className="grid grid-cols-3 gap-2 text-sm max-w-md">
+              <label className="block">
+                Border width
+                <input type="number" min="0" max="20" className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.border?.width ?? 0} onChange={(event) => updateBorder({ width: Number(event.target.value) })} />
+              </label>
+              <label className="block">
+                Corner radius
+                <input type="number" min="0" max="80" className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.border?.radius ?? 0} onChange={(event) => updateBorder({ radius: Number(event.target.value) })} />
+              </label>
+              <label className="block">
+                Border color
+                <div className="mt-1 flex items-center gap-2">
+                  <input type="color" onClick={(e) => e.stopPropagation()} value={/^#[0-9a-fA-F]{6}$/.test(draftLayout.border?.color || '') ? draftLayout.border.color : '#000000'} onChange={(event) => updateBorder({ color: event.target.value })} className="h-8 w-10 rounded bg-transparent cursor-pointer" />
+                  {eyedropperAvailable && (
+                    <button type="button" title="Pick a color from anywhere on screen" onClick={() => pickColorFromScreen((color) => updateBorder({ color }))} className="h-8 w-8 flex-shrink-0 flex items-center justify-center rounded bg-button hover:bg-buttonHover">
+                      <i className="fas fa-eye-dropper"></i>
+                    </button>
+                  )}
+                </div>
+              </label>
+            </div>
+
+            <SectionHeader>Hover effect</SectionHeader>
+            <div className="grid grid-cols-2 gap-2 text-sm max-w-md">
+              <label className="block">
+                Effect
+                <select className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.hoverEffect || 'classic-tilt'} onChange={(event) => updateHoverEffect(event.target.value)}>
+                  <option value="classic-tilt">Classic 3D tilt</option>
+                  <option value="zoom">Steam-style zoom</option>
+                  <option value="none">None</option>
+                </select>
+              </label>
+              <label className="block">
+                Zoom amount ({Math.round((draftLayout.hoverScale ?? 1.02) * 100)}%)
+                <input
+                  type="range"
+                  min="1"
+                  max="1.5"
+                  step="0.01"
+                  disabled={(draftLayout.hoverEffect || 'classic-tilt') === 'none'}
+                  className="mt-2 w-full disabled:opacity-50"
+                  value={draftLayout.hoverScale ?? 1.02}
+                  onChange={(event) => updateHoverScale(Number(event.target.value))}
+                />
+              </label>
+            </div>
+
+            <SectionHeader>Banner shadow</SectionHeader>
+            <div className="space-y-2 text-sm max-w-md">
+              <label className="flex items-center gap-2">
+                <input type="checkbox" checked={draftLayout.shadow?.enabled === true} onChange={(event) => updateShadow({ enabled: event.target.checked })} />
+                Drop a shadow under the banner
+              </label>
+              <label className="block">
+                Shadow color
+                <div className="mt-1 flex items-center gap-2">
+                  <input type="color" onClick={(e) => e.stopPropagation()} disabled={draftLayout.shadow?.enabled !== true} value={/^#[0-9a-fA-F]{6}$/.test(draftLayout.shadow?.color || '') ? draftLayout.shadow.color : '#000000'} onChange={(event) => updateShadow({ color: event.target.value })} className="h-8 w-10 rounded bg-transparent cursor-pointer disabled:opacity-50" />
+                  <input type="text" disabled={draftLayout.shadow?.enabled !== true} value={draftLayout.shadow?.color ?? 'rgba(0,0,0,0.5)'} onChange={(event) => updateShadow({ color: event.target.value })} className="flex-1 min-w-0 bg-secondary border border-border text-text rounded p-1 disabled:opacity-50" placeholder="rgba(0,0,0,0.5) or #000000" />
+                  {eyedropperAvailable && (
+                    <button type="button" disabled={draftLayout.shadow?.enabled !== true} title="Pick a color from anywhere on screen" onClick={() => pickColorFromScreen((color) => updateShadow({ color }))} className="h-8 w-8 flex-shrink-0 flex items-center justify-center rounded bg-button hover:bg-buttonHover disabled:opacity-50">
+                      <i className="fas fa-eye-dropper"></i>
+                    </button>
+                  )}
+                </div>
+              </label>
+            </div>
+
+            <SectionHeader>Icon color</SectionHeader>
+            <div className="space-y-2 text-sm max-w-md">
+              <p className="text-xs opacity-60 -mt-1">Applies to icons on stat fields (playtime, rating, likes, last updated, …). Leave blank to inherit each field's text color.</p>
+              <div className="flex items-center gap-2">
+                <input type="color" onClick={(e) => e.stopPropagation()} value={/^#[0-9a-fA-F]{6}$/.test(draftLayout.iconColor || '') ? draftLayout.iconColor : '#ffffff'} onChange={(event) => updateIconColor(event.target.value)} className="h-8 w-10 rounded bg-transparent cursor-pointer" />
+                <input type="text" value={draftLayout.iconColor ?? ''} onChange={(event) => updateIconColor(event.target.value)} className="flex-1 min-w-0 bg-secondary border border-border text-text rounded p-1" placeholder="(inherit)" />
+                {eyedropperAvailable && (
+                  <button type="button" title="Pick a color from anywhere on screen" onClick={() => pickColorFromScreen((color) => updateIconColor(color))} className="h-8 w-8 flex-shrink-0 flex items-center justify-center rounded bg-button hover:bg-buttonHover">
+                    <i className="fas fa-eye-dropper"></i>
+                  </button>
+                )}
+                <button type="button" title="Clear (inherit)" onClick={() => updateIconColor('')} className="h-8 px-2 flex-shrink-0 flex items-center justify-center rounded bg-button hover:bg-buttonHover text-xs">Clear</button>
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            <SectionHeader>Image</SectionHeader>
+            <label className="flex items-center gap-2 text-sm">
+              <input type="checkbox" checked={draftLayout.image?.visible !== false} onChange={(event) => updateImage({ visible: event.target.checked })} />
+              Show banner image
+            </label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label className="block text-sm">
+                Image fit
+                <select className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.image?.fit || draftLayout.imageFit} onChange={(event) => updateImageFit(event.target.value)}>
+                  <option value="contain">Contain</option>
+                  <option value="cover">Cover</option>
+                </select>
+              </label>
+              <label className="block text-sm">
+                Image background
+                <select className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.image?.backgroundMode || 'image'} onChange={(event) => updateImage({ backgroundMode: event.target.value })}>
+                  <option value="solid">Solid fallback</option>
+                  <option value="image">Single image</option>
+                  <option value="blurred-fill">Blurred image fill</option>
+                </select>
+              </label>
+              <label className="block text-sm">
+                Image position
+                <select className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.image?.position || 'center'} onChange={(event) => updateImage({ position: event.target.value })}>
+                  <option value="center">Center</option>
+                  <option value="top">Top</option>
+                  <option value="bottom">Bottom</option>
+                  <option value="left">Left</option>
+                  <option value="right">Right</option>
+                </select>
+              </label>
+              <label className="block text-sm">
+                Fallback background
+                <select className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.image?.fallbackBackground || 'dark'} onChange={(event) => updateImage({ fallbackBackground: event.target.value })}>
+                  <option value="dark">Dark</option>
+                  <option value="theme">Theme secondary</option>
+                </select>
+              </label>
+            </div>
+            <div className="border border-border rounded p-3 bg-secondary/40 space-y-2 text-sm">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={draftLayout.previewCycle?.enabled === true}
+                  onChange={(event) => updatePreviewCycle({ enabled: event.target.checked })}
+                />
+                Cycle previews on hover
+              </label>
+              <label className="block">
+                Cycle interval (seconds)
+                <input
+                  type="number"
+                  min="0.25"
+                  max="15"
+                  step="0.25"
+                  disabled={draftLayout.previewCycle?.enabled !== true}
+                  className="mt-1 w-full bg-secondary border border-border text-text rounded p-1 disabled:opacity-50"
+                  value={(draftLayout.previewCycle?.intervalMs ?? 2000) / 1000}
+                  onChange={(event) => {
+                    const seconds = Number(event.target.value)
+                    if (!Number.isFinite(seconds)) return
+                    updatePreviewCycle({ intervalMs: Math.round(seconds * 1000) })
+                  }}
+                />
+              </label>
+              <p className="text-xs opacity-60">
+                Hovering a banner in the library cycles through the game's preview images.
+                Video previews are skipped.
+              </p>
+            </div>
+            {(draftLayout.image?.backgroundMode || 'image') === 'blurred-fill' && (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm border border-border rounded p-3 bg-secondary/40">
+                <label>
+                  Blur opacity
+                  <input type="number" min="0" max="1" step="0.05" className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.image?.blurBackground?.opacity ?? 0.6} onChange={(event) => updateBlurBackground({ opacity: Number(event.target.value) })} />
+                </label>
+                <label>
+                  Blur amount
+                  <input type="number" min="0" max="40" step="1" className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.image?.blurBackground?.blur ?? 20} onChange={(event) => updateBlurBackground({ blur: Number(event.target.value) })} />
+                </label>
+                <label>
+                  Blur scale
+                  <input type="number" min="1" max="1.3" step="0.01" className="mt-1 w-full bg-secondary border border-border text-text rounded p-1" value={draftLayout.image?.blurBackground?.scale ?? 1.1} onChange={(event) => updateBlurBackground({ scale: Number(event.target.value) })} />
+                </label>
+              </div>
+            )}
+
+            <SectionHeader>Overlays</SectionHeader>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {['top', 'bottom'].map((position) => (
+                <div key={position} className="space-y-2 border border-border rounded p-3 bg-secondary/40">
+                  <label className="flex items-center gap-2 text-sm">
+                    <input type="checkbox" checked={draftLayout.overlays?.[position]?.visible !== false} onChange={(event) => updateOverlay(position, { visible: event.target.checked })} />
+                    Show {position} dark overlay
+                  </label>
+                  <input type="range" min="0" max="1" step="0.05" value={draftLayout.overlays?.[position]?.opacity ?? 0.8} onChange={(event) => updateOverlay(position, { opacity: Number(event.target.value) })} />
+                  <input type="number" min="0" max="1" step="0.05" className="w-20 bg-secondary border border-border text-text rounded p-1" value={draftLayout.overlays?.[position]?.opacity ?? 0.8} onChange={(event) => updateOverlay(position, { opacity: Number(event.target.value) })} />
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {activeTab === 'panels' && (
+        <section className="space-y-3">
+          <SectionHeader>Panels (space around the image)</SectionHeader>
+          <p className="text-xs opacity-60 -mt-1">
+            Enable a side and give it a size to make the banner larger than the image. The image
+            shrinks to the remaining middle area; the panel is a solid colored box that holds any
+            fields you assign to it (set a field's Region to this side in the Fields tab).
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {[
+              { side: 'top', label: 'Top', sizeLabel: 'Height (px)' },
+              { side: 'bottom', label: 'Bottom', sizeLabel: 'Height (px)' },
+              { side: 'left', label: 'Left', sizeLabel: 'Width (px)' },
+              { side: 'right', label: 'Right', sizeLabel: 'Width (px)' },
+            ].map(({ side, label, sizeLabel }) => {
+              const panel = draftLayout.panels?.[side] || {}
+              const enabled = panel.enabled === true
+              const bg = panel.background || '#0e1116'
+              const fg = panel.textColor || '#ffffff'
+              const hexOnly = (value, fallback) => (/^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback)
+              return (
+                <div key={side} className="space-y-2 border border-border rounded p-3 bg-secondary/40">
+                  <label className="flex items-center gap-2 text-sm font-semibold">
+                    <input type="checkbox" checked={enabled} onChange={(event) => updatePanel(side, { enabled: event.target.checked })} />
+                    {label} panel
+                  </label>
+                  <div className="grid grid-cols-3 gap-2 text-sm">
+                    <label className="block">
+                      {sizeLabel}
+                      <input type="number" min="0" max="400" disabled={!enabled} className="mt-1 w-full bg-secondary border border-border text-text rounded p-1 disabled:opacity-50" value={panel.size ?? 0} onChange={(event) => updatePanel(side, { size: Number(event.target.value) })} />
+                    </label>
+                    <label className="block">
+                      Padding
+                      <input type="number" min="0" max="48" disabled={!enabled} className="mt-1 w-full bg-secondary border border-border text-text rounded p-1 disabled:opacity-50" value={panel.padding ?? 10} onChange={(event) => updatePanel(side, { padding: Number(event.target.value) })} />
+                    </label>
+                    <label className="block">
+                      Gap
+                      <input type="number" min="0" max="32" disabled={!enabled} className="mt-1 w-full bg-secondary border border-border text-text rounded p-1 disabled:opacity-50" value={panel.gap ?? 6} onChange={(event) => updatePanel(side, { gap: Number(event.target.value) })} />
+                    </label>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-sm">
+                    <label className="block">
+                      Background
+                      <div className="mt-1 flex items-center gap-2">
+                        <input type="color" onClick={(e) => e.stopPropagation()} disabled={!enabled} value={hexOnly(bg, '#0e1116')} onChange={(event) => updatePanel(side, { background: event.target.value })} className="h-8 w-10 rounded bg-transparent cursor-pointer disabled:opacity-50" />
+                        <input type="text" disabled={!enabled} value={bg} onChange={(event) => updatePanel(side, { background: event.target.value })} className="flex-1 bg-secondary border border-border text-text rounded p-1 disabled:opacity-50" placeholder="#0e1116 or rgba(...)" />
+                        {eyedropperAvailable && (
+                          <button type="button" disabled={!enabled} title="Pick a color from anywhere on screen" onClick={() => pickColorFromScreen((color) => updatePanel(side, { background: color }))} className="h-8 w-8 flex-shrink-0 flex items-center justify-center rounded bg-button hover:bg-buttonHover disabled:opacity-50">
+                            <i className="fas fa-eye-dropper"></i>
+                          </button>
+                        )}
+                      </div>
+                    </label>
+                  </div>
+                  <div className="space-y-2 text-sm border-t border-border/60 pt-2">
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="block">
+                        Border width
+                        <input type="number" min="0" max="20" disabled={!enabled} className="mt-1 w-full bg-secondary border border-border text-text rounded p-1 disabled:opacity-50" value={panel.border?.width ?? 0} onChange={(event) => updatePanelBorder(side, { width: Number(event.target.value) })} />
+                      </label>
+                      <label className="block">
+                        Border color
+                        <div className="mt-1 flex items-center gap-2">
+                          <input type="color" onClick={(e) => e.stopPropagation()} disabled={!enabled} value={hexOnly(panel.border?.color, '#000000')} onChange={(event) => updatePanelBorder(side, { color: event.target.value })} className="h-8 w-10 rounded bg-transparent cursor-pointer disabled:opacity-50" />
+                          <input type="text" disabled={!enabled} value={panel.border?.color ?? '#000000'} onChange={(event) => updatePanelBorder(side, { color: event.target.value })} className="flex-1 min-w-0 bg-secondary border border-border text-text rounded p-1 disabled:opacity-50" placeholder="#000000" />
+                          {eyedropperAvailable && (
+                            <button type="button" disabled={!enabled} title="Pick a color from anywhere on screen" onClick={() => pickColorFromScreen((color) => updatePanelBorder(side, { color }))} className="h-8 w-8 flex-shrink-0 flex items-center justify-center rounded bg-button hover:bg-buttonHover disabled:opacity-50">
+                              <i className="fas fa-eye-dropper"></i>
+                            </button>
+                          )}
+                        </div>
+                      </label>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <span className="opacity-70">Border sides:</span>
+                      {['top', 'right', 'bottom', 'left'].map((edge) => (
+                        <label key={edge} className="flex items-center gap-1 capitalize">
+                          <input type="checkbox" disabled={!enabled} checked={panel.border?.[edge] === true} onChange={(event) => updatePanelBorder(side, { [edge]: event.target.checked })} />
+                          {edge}
+                        </label>
+                      ))}
+                      <button type="button" disabled={!enabled} className="text-xs underline opacity-80 hover:opacity-100 disabled:opacity-40" onClick={() => updatePanelBorder(side, { top: true, right: true, bottom: true, left: true })}>All</button>
+                      <button type="button" disabled={!enabled} className="text-xs underline opacity-80 hover:opacity-100 disabled:opacity-40" onClick={() => updatePanelBorder(side, { top: false, right: false, bottom: false, left: false })}>None</button>
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </section>
+      )}
+
+      
+      {activeTab === 'export' && (
+        <section className="space-y-4">
+          <SectionHeader>Import / Export</SectionHeader>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className="bg-secondary border border-border text-text px-3 py-1 rounded hover:bg-tertiary" onClick={handleExportPreset}>Export preset</button>
+            <button type="button" className="bg-secondary border border-border text-text px-3 py-1 rounded hover:bg-tertiary" onClick={handleImportPreset}>Import preset</button>
+          </div>
+        </section>
+      )}
+      </div>
+
+      {screenPickerApply && (
+        <ScreenColorPicker
+          onPick={(hex) => {
+            try { screenPickerApply?.(hex) } finally { setScreenPickerApply(null) }
+          }}
+          onCancel={() => setScreenPickerApply(null)}
+        />
+      )}
+    </div>
+  )
+}
+
+export default BannerEditor

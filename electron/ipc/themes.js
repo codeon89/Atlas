@@ -1,0 +1,234 @@
+'use strict'
+
+const { ipcMain, BrowserWindow, shell } = require('electron')
+const fs = require('fs')
+const path = require('path')
+
+// font-list queries the OS's actually-installed fonts (Windows GDI, macOS
+// Core Text, Linux fontconfig) — see get-system-fonts below. Loaded
+// lazily/defensively: if someone hasn't run `npm install` since this was
+// added as a dependency, the rest of the app should still start up fine
+// rather than crashing on a missing module; get-system-fonts just returns
+// an empty list in that case and the renderer falls back to its own
+// built-in safe defaults (see FALLBACK_FONTS in ThemeBuilder.jsx).
+let fontList = null
+try {
+  fontList = require('font-list')
+} catch (err) {
+  console.warn('font-list not installed — run `npm install` to enable system font listing in the Theme Builder. Falling back to built-in font presets.')
+}
+
+// Atlas used to seed one example theme (XLibrary) into a fresh
+// templates/theme/ folder on first run, so there was a working second
+// theme to look at immediately. No longer the case — only the built-in
+// Default theme (src/theme/themes.js) ships now. seedThemesIfEmpty below
+// is kept (rather than removed) since it's a harmless no-op with this
+// empty list, and gives somewhere obvious to add a seed theme back in the
+// future without re-deriving the plumbing.
+const SEED_THEMES = []
+
+// Structural validation only — NOT the full field-by-field schema check.
+// That's normalizeTheme() on the renderer side (src/theme/themes.js),
+// which is the authoritative source for the theme shape (THEME_COLOR_KEYS,
+// RADIUS_OPTIONS, etc.) and already has tests covering it. Duplicating that
+// full list here in CommonJS would just create a second copy to keep in
+// sync. This check exists only to stop genuinely broken files (not valid
+// JSON, not an object, no colors at all) from reaching the renderer.
+function isPlausibleTheme(parsed) {
+  return (
+    parsed &&
+    typeof parsed === 'object' &&
+    typeof parsed.colors === 'object' &&
+    parsed.colors !== null
+  )
+}
+
+// "my theme.json" -> "my-theme", "Xlibrary.JSON" -> "xlibrary". Lowercased
+// and slugified so ids are stable, URL/CSS-attribute-safe (used in
+// data-theme="...", see applyTheme.js), and so two filenames that only
+// differ by case or spacing can't silently collide.
+function idFromFilename(filename) {
+  return path
+    .basename(filename, path.extname(filename))
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'theme'
+}
+
+module.exports = function registerThemeHandlers(ctx) {
+  const { themeTemplatesDir, templatesDir, createThemeBuilderWindow } = ctx
+
+  // Seed the example theme(s) on first run only — i.e. only if the folder
+  // is completely empty. If a person deletes xlibrary.json on purpose,
+  // Atlas will NOT recreate it on next launch; "empty folder" is only
+  // assumed to mean "never set up," not "user doesn't want any themes."
+  function seedThemesIfEmpty() {
+    try {
+      if (!fs.existsSync(themeTemplatesDir)) {
+        fs.mkdirSync(themeTemplatesDir, { recursive: true })
+      }
+      const existing = fs.readdirSync(themeTemplatesDir)
+      if (existing.length > 0) return
+      for (const seed of SEED_THEMES) {
+        const filePath = path.join(themeTemplatesDir, seed.filename)
+        fs.writeFileSync(filePath, JSON.stringify(seed.theme, null, 2) + '\n', 'utf8')
+      }
+    } catch (err) {
+      console.error('Failed to seed example theme files:', err)
+    }
+  }
+
+  seedThemesIfEmpty()
+
+  ipcMain.handle('get-available-themes', async () => {
+    try {
+      if (!fs.existsSync(themeTemplatesDir)) return []
+      const files = fs.readdirSync(themeTemplatesDir).filter((f) => f.endsWith('.json'))
+
+      const themes = []
+      for (const filename of files) {
+        const filePath = path.join(themeTemplatesDir, filename)
+        try {
+          const raw = fs.readFileSync(filePath, 'utf8')
+          const parsed = JSON.parse(raw)
+          if (!isPlausibleTheme(parsed)) {
+            console.warn(`Skipping ${filename}: not a valid theme file (missing "colors" object)`)
+            continue
+          }
+          // id is always derived from the filename, even if the file itself
+          // specifies a different id — this guarantees uniqueness (the
+          // filesystem already enforces no two files share a name) and
+          // means renaming a file is how a person "renames" a theme's slot,
+          // without needing to also edit the file's contents to match.
+          themes.push({ ...parsed, id: idFromFilename(filename) })
+        } catch (err) {
+          console.warn(`Skipping ${filename}: failed to parse (${err.message})`)
+        }
+      }
+      return themes
+    } catch (err) {
+      console.error('get-available-themes error:', err)
+      return []
+    }
+  })
+
+  // Used by the Theme Builder (src/components/settings/ThemeBuilder.jsx)
+  // "Save as New Theme" step. Writes a new file into templates/theme/ —
+  // the SAME directory get-available-themes reads from above, and the
+  // SAME mechanism XLibrary's seed file already uses — so a saved theme
+  // immediately shows up in the regular Appearance theme picker on next
+  // load, no separate storage path needed.
+  //
+  // name is slugified into a filename the same way idFromFilename()
+  // derives an id from one, so the resulting id is predictable from the
+  // name the person typed. If that slug collides with an existing file,
+  // overwrite is required to proceed — this is a deliberate "are you
+  // sure" gate rather than silently appending "-2" to the filename, since
+  // a person picking an existing theme's exact name most likely means to
+  // replace it.
+  ipcMain.handle('save-theme', async (event, theme, { overwrite = false } = {}) => {
+    try {
+      if (!theme || typeof theme !== 'object' || !theme.name || typeof theme.name !== 'string') {
+        return { success: false, error: 'Theme must have a name.' }
+      }
+      if (!isPlausibleTheme(theme)) {
+        return { success: false, error: 'Theme is missing a colors object.' }
+      }
+      if (!fs.existsSync(themeTemplatesDir)) {
+        fs.mkdirSync(themeTemplatesDir, { recursive: true })
+      }
+      const slug = idFromFilename(theme.name)
+      const filename = `${slug}.json`
+      const filePath = path.join(themeTemplatesDir, filename)
+      if (fs.existsSync(filePath) && !overwrite) {
+        return { success: false, error: 'A theme with this name already exists.', exists: true }
+      }
+      // Strip id before writing — id is always derived from the filename
+      // on read (see idFromFilename() above), so persisting a stale id
+      // field here would just be dead weight that get-available-themes
+      // ignores anyway.
+      const { id, ...themeToWrite } = theme
+      fs.writeFileSync(filePath, JSON.stringify(themeToWrite, null, 2) + '\n', 'utf8')
+      // Tell every open window the theme list on disk changed, so their
+      // ThemeProvider re-reads templates/theme/ and the new theme shows up
+      // in the Appearance picker immediately — no client restart needed.
+      // The Theme Builder is its own window, so the Settings/Appearance
+      // window that needs to update is a DIFFERENT one than the sender;
+      // broadcast to all (harmless for windows that don't list themes).
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) win.webContents.send('themes-changed')
+      })
+      return { success: true, theme: { ...themeToWrite, id: slug } }
+    } catch (err) {
+      console.error('save-theme error:', err)
+      return { success: false, error: err.message }
+    }
+  })
+
+  // Opens the Theme Builder as its own BrowserWindow (see
+  // createThemeBuilderWindow in main.js) — called from the "Open Theme
+  // Builder" button on Appearance.jsx, same pattern as open-settings/
+  // open-importer elsewhere in this app.
+  ipcMain.handle('open-theme-builder', () => {
+    createThemeBuilderWindow()
+  })
+
+  // Relays a live draft theme from the Theme Builder window to every
+  // OTHER open window, so the in-progress edit is visible app-wide (main
+  // library, Settings, etc.) as the person adjusts colors/effects/nav
+  // settings — not just within the builder window itself. Sent on every
+  // draft change (see ThemeBuilder.jsx's live-preview effect), so this is
+  // a high-frequency channel during an active drag/slider interaction;
+  // kept deliberately simple (no diffing/throttling here) since a full
+  // theme object is small and applyTheme() on the receiving end is cheap.
+  // event.sender is excluded so the builder window doesn't needlessly
+  // re-receive and re-apply its own change.
+  ipcMain.handle('broadcast-theme-preview', (event, draftTheme) => {
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed() && win.webContents.id !== event.sender.id) {
+        win.webContents.send('theme-preview-changed', draftTheme)
+      }
+    })
+  })
+
+  // Lists fonts actually installed on THIS computer (via font-list, see
+  // the require at the top of this file), for the Theme Builder's Font
+  // picker — see ThemeBuilder.jsx. Returns an empty array (never throws)
+  // if font-list isn't installed or the OS query fails for any reason;
+  // the renderer's own FALLBACK_FONTS covers that case so the picker is
+  // never left completely empty.
+  ipcMain.handle('get-system-fonts', async () => {
+    if (!fontList) return []
+    try {
+      const fonts = await fontList.getFonts({ disableQuoting: true })
+      // getFonts() can return duplicates (different weights/styles
+      // sharing a family name) — dedupe and sort for a clean picker list.
+      return Array.from(new Set(fonts)).sort((a, b) => a.localeCompare(b))
+    } catch (err) {
+      console.error('get-system-fonts error:', err)
+      return []
+    }
+  })
+
+  // Reveal the user-editable theme JSON folder / banner template folder in
+  // the OS file manager (Explorer / Finder / Files). The renderer never
+  // knows these absolute paths (they resolve from the app data root in
+  // main.js), so opening them has to go through the main process. Both
+  // ensure the directory exists first so the button never silently fails
+  // on a fresh install where the folder hasn't been created yet.
+  const openFolder = async (dir) => {
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+      const error = await shell.openPath(dir)
+      return { success: !error, error: error || undefined }
+    } catch (err) {
+      console.error('Failed to open folder:', dir, err)
+      return { success: false, error: String(err?.message || err) }
+    }
+  }
+
+  ipcMain.handle('open-themes-folder', () => openFolder(themeTemplatesDir))
+  ipcMain.handle('open-banners-folder', () => openFolder(templatesDir))
+
+}
+

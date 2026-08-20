@@ -1,0 +1,125 @@
+import useImageFallback from '../../../hooks/useImageFallback.js'
+import SafeImage from '../../ui/SafeImage.jsx'
+
+export default function HeroBanner({ game, heroOverride = null, bannerRef, bannerDimsRef, bannerMask, onLoad, onBack, showBack = true }) {
+  const isCatalogEntry = game.isCatalogEntry === true
+  // When the hero is Steam key-art, zoom it slightly so it fills the frame the
+  // way Steam presents library_hero (which has built-in padding).
+  const isSteamHero = !!(game.steam_appid || game.steam_id || heroOverride)
+
+  // hero_candidates already encode the fallback chain (steam CDN → steam fastly
+  // → next source's banner). Fall back to the single-url fields for older data.
+  // heroOverride (the selected Steam version's appid hero) takes priority and is
+  // tried first; useImageFallback falls through to the normal chain if it fails.
+  const baseChain = game.hero_candidates || [game.hero_url, game.banner_url]
+  const heroChain = heroOverride ? [heroOverride, ...baseChain] : baseChain
+  const logoChain = game.logo_candidates || (game.logo_url ? [game.logo_url] : [])
+
+  const { src: heroUrl } = useImageFallback(heroChain)
+  const { src: logoUrl, failed: logoFailed } = useImageFallback(logoChain)
+  const showLogo = logoUrl && !logoFailed
+
+  return (
+    <div ref={bannerRef} style={{ position: 'relative', height: 370, flexShrink: 0, overflow: 'hidden', backgroundColor: 'var(--color-primary)' }}>
+      {/* Blurred background fill */}
+      {heroUrl && (
+        <SafeImage src={heroUrl} alt="" fallbackMode="hidden" fallbackContent={false} style={{
+          position: 'absolute', inset: 0, width: '100%', height: '100%',
+          objectFit: 'cover',
+          filter: 'blur(20px)',
+          transform: 'scale(1.1)', opacity: 0.6,
+        }} placeholderStyle={{ background: 'transparent' }} />
+      )}
+      {!heroUrl && <div style={{ position: 'absolute', inset: 0, background: 'var(--color-primary)' }} />}
+
+      {/* Foreground */}
+      {heroUrl && (
+        <SafeImage src={heroUrl} alt={`${game.title || 'Game'} hero image`}
+          fallbackMode="hidden"
+          onLoad={(e) => {
+            bannerDimsRef.current = { w: e.target.naturalWidth, h: e.target.naturalHeight }
+            onLoad()
+          }}
+          style={{
+            position: 'absolute', inset: 0, width: '100%', height: '100%',
+            objectFit: 'contain',
+            transform: isSteamHero ? 'scale(1.15)' : undefined,
+            filter: 'none',
+            WebkitMaskImage: bannerMask.image,
+            maskImage: bannerMask.image,
+            ...(bannerMask.composite
+              ? { WebkitMaskComposite: 'source-in', maskComposite: bannerMask.composite }
+              : {}),
+          }}
+        />
+      )}
+
+      {/* Bottom fade */}
+      <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(to bottom, rgba(0,0,0,0.1) 0%, transparent 30%, var(--color-tertiary,#12161f) 100%)' }} />
+
+      {/* Back button (top-left over the hero). Hidden once the action bar
+          sticks — the bar shows its own Back button then. */}
+      <div style={{ position: 'absolute', top: 14, left: 14, transition: 'opacity 0.15s', opacity: showBack ? 1 : 0, pointerEvents: showBack ? 'auto' : 'none' }}>
+        <button onClick={onBack}
+          className="text-xs text-white px-3 py-2 border border-white/10 transition-colors"
+          style={{
+            background: 'rgba(0,0,0,0.45)',
+            backdropFilter: 'blur(4px)',
+            WebkitBackdropFilter: 'blur(4px)',
+            textShadow: '0 1px 3px rgba(0,0,0,0.8)',
+          }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.65)' }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = 'rgba(0,0,0,0.45)' }}
+        >
+          <i className="fas fa-arrow-left" style={{ marginRight: 6 }}></i>Back to Library
+        </button>
+      </div>
+
+      {/* Title / logo. Steam provides a logo_placement (pinned corner + size %);
+          when present we honor it, otherwise fall back to bottom-left. Bottom
+          padding clears the action bar overlapping the hero's lower edge. */}
+      {showLogo ? (
+        (() => {
+          const placement = game.logo_placement || null
+          // Map Steam's pinned_position to flexbox alignment.
+          const pin = String(placement?.pinned || 'BottomLeft')
+          const vertical = pin.startsWith('Top') ? 'flex-start' : pin.startsWith('Center') ? 'center' : 'flex-end'
+          const horizontal = pin.endsWith('Left') ? 'flex-start' : pin.endsWith('Center') ? 'center' : pin.endsWith('Right') ? 'flex-end' : 'flex-start'
+          // Steam's width_pct/height_pct are percentages of the hero the logo
+          // should occupy. Fall back to the previous sizing when absent.
+          const widthPct = placement?.widthPct ? `${Math.min(100, placement.widthPct)}%` : '80%'
+          const maxH = placement?.heightPct ? `${Math.min(100, placement.heightPct)}%` : undefined
+          return (
+            <div style={{
+              position: 'absolute', inset: 0, display: 'flex',
+              alignItems: vertical, justifyContent: horizontal,
+              padding: '48px 40px 80px', pointerEvents: 'none',
+            }}>
+              <SafeImage
+                src={logoUrl}
+                alt={game.title || 'Game logo'}
+                fallbackMode="hidden"
+                style={{
+                  width: widthPct,
+                  maxWidth: '80%',
+                  maxHeight: maxH || 220,
+                  objectFit: 'contain',
+                  filter: 'drop-shadow(0 2px 8px rgba(0,0,0,0.8))',
+                }}
+              />
+            </div>
+          )
+        })()
+      ) : (
+        <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: '0 24px 70px' }}>
+          <div className="text-sm text-highlight" style={{ marginBottom: 2, opacity: 0.9 }}>
+            {game.creator || 'Unknown creator'}
+          </div>
+          <h1 style={{ fontSize: 32, fontWeight: 700, lineHeight: 1.2, textShadow: '0 2px 8px rgba(0,0,0,0.8)' }}>
+            {game.title || 'Untitled Game'}
+          </h1>
+        </div>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,182 @@
+import f95Logo from '../../../assets/images/f95_full.png'
+import atlasLogo from '../../../assets/images/atlas_logo_full.svg'
+import GogIcon from '../../ui/GogIcon.jsx'
+import { parseExternalIds, buildExternalLinks } from '../externalLinks.js'
+import { getMappedSteamAppId, getMappedGogId } from '../page/gameDetailUtils.js'
+
+const normalizeF95DisplayId = (value) => {
+  const normalized = String(value ?? '').trim()
+  if (!normalized) return ''
+  if (/^\d+$/.test(normalized)) return normalized
+
+  const threadMatch = normalized.match(/\/threads\/(?:[^/\s.]+\.)?(\d+)(?:[/?#]|$)/i)
+  return threadMatch ? threadMatch[1] : normalized
+}
+
+export default function MappingsTab({ game, onAddMapping }) {
+  const externalIds = parseExternalIds(game.external_ids)
+  // Manual (user-set) source ids override/supplement the derived ones. Stored
+  // as a JSON blob on the game (see set-manual-mappings / getGame).
+  const manualIds = parseExternalIds(game.manual_external_ids)
+  const steamAppId = manualIds.steam_appid || manualIds.steam_id || getMappedSteamAppId(game)
+  // Full set of Steam appids to show as mapping rows: the array form
+  // (external_ids.steam_appids, from admin manual links = multiple seasons),
+  // the scalar forms, the client-local manual override, and the mapping.
+  // Deduped, order-preserving.
+  const steamAppIds = (() => {
+    const out = []
+    const seen = new Set()
+    const add = (v) => {
+      const s = String(v ?? '').trim()
+      if (s && !seen.has(s)) { seen.add(s); out.push(s) }
+    }
+    // steam_appids may be a real array, a JSON-string array, or CSV.
+    const coerceList = (val) => {
+      if (Array.isArray(val)) return val
+      const s = String(val ?? '').trim()
+      if (!s) return []
+      if (s.startsWith('[')) { try { const p = JSON.parse(s); if (Array.isArray(p)) return p } catch { /* csv */ } }
+      return s.includes(',') ? s.split(',') : [s]
+    }
+    coerceList(externalIds.steam_appids).forEach(add)
+    add(externalIds.steam_appid)
+    add(externalIds.steam_id)
+    add(manualIds.steam_appid)
+    add(manualIds.steam_id)
+    add(steamAppId)
+    return out
+  })()
+  const gogId = manualIds.gog_id || manualIds.gog_appid || getMappedGogId(game)
+  const f95DisplayId = normalizeF95DisplayId(manualIds.f95_id || game.f95_id)
+  const lewdCornerId = manualIds.lc_id || manualIds.lewdcorner_id || game.lc_id || game.lcId || game.lewdCornerId || externalIds.lc_id || externalIds.lewdcorner_id || null
+  const iconCellClass = 'p-2 w-24 align-middle'
+  const iconFrameClass = 'flex h-10 w-20 items-center justify-center'
+
+  // Steam is the only external source that carries a real id, so it is shown in
+  // the mappings table alongside Atlas/F95. Everything else in external_ids is a
+  // plain link (patreon, twitter, itch, …).
+  const otherLinks = buildExternalLinks(externalIds).filter(
+    (link) => !['steam_appid', 'steam_id', 'gog_id', 'gog_appid', 'lc_id', 'lewdcorner_id'].includes(link.key.toLowerCase()),
+  )
+
+  const hasAnyMapping = f95DisplayId || game.atlas_id || steamAppIds.length > 0 || gogId || lewdCornerId
+
+  return (
+    <>
+      <div className="flex flex-col gap-4">
+        <div className="flex justify-end">
+          <button onClick={onAddMapping} className="px-4 py-1 bg-button hover:bg-buttonHover rounded">
+            Add Mapping
+          </button>
+        </div>
+        <table className="w-full border-collapse">
+          <thead>
+            <tr className="bg-primary">
+              <th className="p-2 text-left"></th>
+              <th className="p-2 text-left">Mapper</th>
+              <th className="p-2 text-left">ID</th>
+            </tr>
+          </thead>
+          <tbody>
+            {f95DisplayId && (
+              <tr className="border-b border-border">
+                <td className={iconCellClass}>
+                  <div className={iconFrameClass}>
+                    <img src={f95Logo} alt="F95Zone Logo" className="block h-10 w-20 object-contain" />
+                  </div>
+                </td>
+                <td className="p-2">F95Zone</td>
+                <td className="p-2">{f95DisplayId}</td>
+              </tr>
+            )}
+            {game.atlas_id && (
+              <tr className="border-b border-border">
+                <td className={iconCellClass}>
+                  <div className={iconFrameClass}>
+                    <img src={atlasLogo} alt="Atlas Logo" className="block h-10 w-20 object-contain" />
+                  </div>
+                </td>
+                <td className="p-2">Atlas</td>
+                <td className="p-2">{game.atlas_id}</td>
+              </tr>
+            )}
+            {steamAppIds.map((appId) => (
+              <tr key={`steam-${appId}`} className="border-b border-border">
+                <td className={iconCellClass}>
+                  <div className={iconFrameClass}>
+                    <i className="fab fa-steam block text-[28px] leading-none" aria-hidden="true"></i>
+                  </div>
+                </td>
+                <td className="p-2">Steam</td>
+                <td className="p-2">{appId}</td>
+              </tr>
+            ))}
+            {gogId && (
+              <tr className="border-b border-border">
+                <td className={iconCellClass}>
+                  <div className={iconFrameClass}>
+                    <GogIcon size={28} className="block" />
+                  </div>
+                </td>
+                <td className="p-2">GOG</td>
+                <td className="p-2">{gogId}</td>
+              </tr>
+            )}
+            {lewdCornerId && (
+              <tr className="border-b border-border">
+                <td className={iconCellClass}>
+                  <div className={iconFrameClass}>
+                    <i className="fas fa-link block text-[24px] leading-none" aria-hidden="true"></i>
+                  </div>
+                </td>
+                <td className="p-2">LewdCorner</td>
+                <td className="p-2">{lewdCornerId}</td>
+              </tr>
+            )}
+            {!hasAnyMapping && (
+              <tr><td colSpan="3" className="p-2 text-center">No mappings available</td></tr>
+            )}
+          </tbody>
+        </table>
+
+        {otherLinks.length > 0 && (
+          <div>
+            <h3 className="text-sm font-semibold mb-2 opacity-80">External Links</h3>
+            <table className="w-full border-collapse">
+              <tbody>
+                {otherLinks.map((link) => (
+                  <tr key={link.key} className="border-b border-border">
+                    <td className="p-2 w-10 text-center">
+                      {link.iconImage ? (
+                        <GogIcon size={16} className="inline-block" />
+                      ) : (
+                        <i className={link.icon} aria-hidden="true"></i>
+                      )}
+                    </td>
+                    <td className="p-2">{link.label}</td>
+                    <td className="p-2">
+                      {link.url ? (
+                        <a
+                          href={link.url}
+                          onClick={(e) => {
+                            e.preventDefault()
+                            window.electronAPI.openExternalUrl(link.url)
+                          }}
+                          className="text-accent hover:underline cursor-pointer break-all"
+                        >
+                          {link.value}
+                        </a>
+                      ) : (
+                        <span className="break-all">{link.value}</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </>
+  )
+}

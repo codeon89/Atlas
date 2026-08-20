@@ -1,0 +1,75 @@
+<div align="center">
+  <a href="https://atlas-gamesdb.com/">
+    <img height="180px" src="https://github.com/towerwatchman/Atlas/blob/main/src/assets/images/atlas_logo_full.svg" alt="atlas logo">
+  </a>
+  
+<!--![GitHub release (with filter)](https://img.shields.io/github/v/release/towerwatchman/Atlas?style=flat&logo=github&logoColor=white&label=)-->
+[![React](https://img.shields.io/badge/-ReactJs-21222B?&logo=react&logoColor=8ED5FF&style=for-the-badge)](#)
+[![Windows](https://custom-icon-badges.demolab.com/badge/Windows-0078D6?logo=windows11&logoColor=white&style=for-the-badge)](#)
+[![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](#)
+[![Electron](https://img.shields.io/badge/-electron-61DBFB?style=for-the-badge&labelColor=17202A&logo=electron&logoColor=61DBFB)](#)
+[![SQLite](https://img.shields.io/badge/SQLite-%2307405e.svg?logo=sqlite&logoColor=white&style=for-the-badge)](#)
+<!--[![MacOS](https://shields.io/badge/MacOS--9cf?logo=Apple&style=social)](#)-->
+
+<!--![Static Badge](https://img.shields.io/badge/-docs-green.svg?logo=Wikipedia)-->
+
+![GitHub Workflow Status (with event)](https://img.shields.io/github/actions/workflow/status/towerwatchman/Atlas/.github%2Fworkflows%2Fmain.yml?event=push&label=release&style=for-the-badge)
+![GitHub issues](https://img.shields.io/github/issues-raw/towerwatchman/Atlas?style=for-the-badge)
+![GitHub pull requests](https://img.shields.io/github/issues-pr-raw/towerwatchman/Atlas?style=for-the-badge)
+![GitHub all releases](https://img.shields.io/github/downloads/towerwatchman/Atlas/total?style=for-the-badge)
+<!--![GitHub Workflow Status (with event)](https://img.shields.io/github/actions/workflow/status/towerwatchman/Atlas/.github%2Fworkflows%2Fpr-test-build.yml?event=push&label=pr)-->
+</div>
+
+#
+Atlas is an open source game manager and launcher for Windows and Linux with a modern interface for viewing, finding, and easily installing and organizing your game library. Whether you're managing a small personal collection or hundreds of titles from multiple sources, Atlas keeps everything organized, searchable, and easy to launch.
+It's meant to replace [Game-List](https://www.game-list.org) ([Github](https://github.com/game-list/game-list)) but also expand on it's feature set.
+
+Atlas is for the user that wants ease of use, quality of life and have the software do the heavy lifting for you.
+
+For discussion about future releases and new features please visit our [Discord Server](https://discord.gg/XpTHvYbYyz).
+
+We have an threads here: [F95Zone](https://f95zone.to/threads/305805/) & [LewdCorner](https://lewdcorner.com/threads/23964/)
+
+## Adult / Lewd Game Support
+Atlas includes optional support for browsing and managing adult-oriented games and visual novels, with metadata sourced from:
+- [F95Zone](https://f95zone.to/)
+- [LewdCorner](https://www.lewdcorner.com/)
+- [Steam](https://store.steampowered.com/)
+
+This mode is opt-in. Atlas does not host, produce, or distribute any of the underlying game files or adult imagery — all content is sourced and loaded directly from the third-party sites listed above. Atlas does not store, cache, or host any images or videos; all such media remains hosted on, and is loaded directly from, the originating third-party site. Atlas only stores text-based metadata (titles, tags, descriptions, links, etc.) locally; it is the user's responsibility to comply with the laws and platform policies applicable to them.
+
+## Data Storage & Updates
+All game metadata is stored locally in a SQLite database on your machine. Atlas periodically syncs with supported sources (including F95Zone and LewdCorner) multiple times a day to keep metadata, tags, and listings up to date.
+
+## Features:
+A summary of planned features is listed below. We do not have a timeline for all features yet
+- Fast and Snappy UI.
+- Easy to understand UI written htmls/js
+- Custom themes and color schemes.
+- Game file management (moves or copies game install files for you)
+- Easy to edit metadata and tags per title.
+- Navigate titles with a Banner/Thumbnail gallery grid (Images are not automatically downloaded yet).
+- View or add previews for a title.
+- Filter titles based on titles, creators, tags, ID's, description contents and urls.
+- Bulk install/import multiple titles and versions with a single click.
+- Compresses all banner and preview images to smaller webp files for storage optimization.
+- Steam support for games you already have installed via Steam.
+
+## Download
+Grab the latest version from the [releases](https://github.com/towerwatchman/Atlas/releases) page. Once installed, Atlas will automatically notify you once there is a new version available. 
+
+## Questions & Issues
+Please report any bugs by filing an issue. Please attach the log in the root of the Atlas directory.
+
+
+## Roadmap
+All planned versions with their features are listed in the [milstones overview](https://github.com/towerwatchman/Atlas/milestones)
+
+## Contributing
+
+Read **[CONTRIBUTING.md](./CONTRIBUTING.md)** before writing code. In short:
+branch from `nightly` (never `main`), ship a passing test with new behaviour and
+a regression test with fixes, comment new functions and IPC handlers, and run
+`npm run check` before you push.
+
+AI coding agents: see [CLAUDE.md](./CLAUDE.md) / [AGENTS.md](./AGENTS.md).

@@ -1,0 +1,2927 @@
+import { Component, useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import ContextMenu from './components/ui/ContextMenu.jsx'
+import { buildGameContextMenu } from './components/library/gameContextMenu.js'
+import { AutoSizer, Grid } from 'react-virtualized'
+import Sidebar from './components/ui/Sidebar.jsx'
+import TopNav from './components/ui/TopNav.jsx'
+import AboutModal from './components/ui/AboutModal.jsx'
+import WelcomeTour from './components/ui/WelcomeTour.jsx'
+import WelcomePage, { WELCOME_SEEN_KEY } from './components/ui/WelcomePage.jsx'
+import { atlasLogo } from './assets/icons/data.js'
+import coloredAtlasLogoUrl from './assets/images/atlas_logo_full.svg'
+import { getBannerTotalSize } from './components/library/bannerLayout/bannerLayoutSchema.js'
+import GameBanner from './components/library/GameBanner.jsx'
+import GameTree from './components/library/GameTree.jsx'
+import CollectionsView from './components/collections/CollectionsView.jsx'
+import CollectionModal from './components/collections/CollectionModal.jsx'
+import BulkTagModal from './components/collections/BulkTagModal.jsx'
+import { useCollections, UNCATEGORIZED_ID } from './hooks/useCollections.js'
+import { retainImage } from './utils/imageRetention.js'
+import { toMediaSrc } from './utils/mediaSrc.js'
+import SearchBox from './components/search/SearchBox.jsx'
+import SearchSidebar from './components/search/SearchSidebar.jsx'
+import GameDetailPage from './components/detail/GameDetailPage.jsx'
+import RefreshMediaModal from './components/ui/RefreshMediaModal.jsx'
+import DownloadsPage from './components/downloads/DownloadsPage.jsx'
+import UpdateModal from './components/downloads/UpdateModal.jsx'
+import UpdateAllSession from './components/downloads/UpdateAllSession.jsx'
+import InstallFlowHost from './components/downloads/InstallFlowHost.jsx'
+import LibraryUpdateModal from './components/ui/LibraryUpdateModal.jsx'
+import DownloadsStatus from './components/downloads/DownloadsStatus.jsx'
+import { useToast } from './components/ui/toast/ToastContext.jsx'
+import { useGames } from './hooks/useGames.js'
+import {
+  defaultFilters, filterGamesWithState, normalizeFilterState, useFilters,
+  setDefaultSearchFieldIds, resolveSearchFieldIds,
+  makeCatalogSearch, catalogParamsKey,
+} from './hooks/useFilters.js'
+import { DEFAULT_SEARCH_FIELD_IDS, normalizeSearchFieldIds } from './utils/searchFields.js'
+import { useAppUpdate } from './hooks/useAppUpdate.js'
+import { useWindowState } from './hooks/useWindowState.js'
+import { useTheme } from './theme/ThemeProvider.jsx'
+import { useBannerTemplate } from './theme/BannerTemplateProvider.jsx'
+import { getGameTitle, normalizeGameForRenderer } from './utils/gameDisplay.js'
+import { getWishlistIdentityKey, withWishlistStates } from './utils/wishlistIdentity.js'
+import { formatPercent, formatProgressNumber, sanitizePercentText } from './utils/formatPercent.js'
+import { BROWSE_MODE_ENABLED } from './features.js'
+
+const debounce = (func, delay) => {
+  let timeout
+  return (...args) => {
+    clearTimeout(timeout)
+    timeout = setTimeout(() => func(...args), delay)
+  }
+}
+
+const SIDE_PANEL_MODES = {
+  HIDDEN: 'hidden',
+  GAMES: 'games',
+  SAVED_FILTERS: 'savedFilters',
+  CATALOG: 'catalog',
+  WISHLIST: 'wishlist',
+}
+
+const getLocalRecordIdForCatalogRow = (game = {}) => {
+  for (const value of [game.localRecordId, game.installedRecordId, game.local_record_id]) {
+    const id = Number.parseInt(value, 10)
+    if (Number.isInteger(id) && id > 0) return id
+  }
+  return null
+}
+
+const knownSidePanelModes = new Set(Object.values(SIDE_PANEL_MODES))
+
+const normalizeSidePanelMode = (value, legacyShowGameList = true, browseAvailable = BROWSE_MODE_ENABLED) => {
+  if (!browseAvailable && value === SIDE_PANEL_MODES.CATALOG) {
+    return SIDE_PANEL_MODES.GAMES
+  }
+  if (knownSidePanelModes.has(value)) return value
+  return legacyShowGameList === false ? SIDE_PANEL_MODES.HIDDEN : SIDE_PANEL_MODES.GAMES
+}
+
+const sanitizeProgressState = (progress = {}) => ({
+  ...progress,
+  text: sanitizePercentText(progress.text),
+})
+
+const sanitizeFooterToastText = (value, source) => {
+  const raw = String(value || '')
+  const formatted = sanitizePercentText(raw)
+  if (formatted !== raw) {
+    try {
+      if (globalThis.localStorage?.getItem('atlasDebugFooterToastPercent') === 'true') {
+        console.debug('footer-toast percent formatted', {
+          source,
+          raw,
+          formatted,
+        })
+      }
+    } catch {
+      // Debug logging is best-effort only.
+    }
+  }
+  return formatted
+}
+
+export class AppErrorBoundary extends Component {
+  constructor(props) {
+    super(props)
+    this.state = { error: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error }
+  }
+
+  componentDidCatch(error, info) {
+    console.error('Atlas renderer error:', error, info)
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="h-screen bg-tertiary text-text flex items-center justify-center p-6 overflow-hidden">
+          <div className="bg-secondary border border-border rounded p-4 max-w-xl">
+            <h1 className="text-lg font-bold mb-2">Atlas hit a display error</h1>
+            <p className="text-sm opacity-80 mb-3">
+              This view could not render, but the app stayed open. Restart Atlas if the view does not recover.
+            </p>
+            <pre className="text-xs whitespace-pre-wrap break-words bg-primary p-3 rounded">
+              {this.state.error?.message || String(this.state.error)}
+            </pre>
+          </div>
+        </div>
+      )
+    }
+
+    return this.props.children
+  }
+}
+
+const App = () => {
+  const [selectedGame, setSelectedGame] = useState(null)
+  const [sidebarMode, setSidebarMode] = useState(SIDE_PANEL_MODES.GAMES)
+  const [libraryMode, setLibraryMode] = useState('local')
+  const [showSearchSidebar, setShowSearchSidebar] = useState(false)
+  const [userSavedFilters, setUserSavedFilters] = useState([])
+  const [wishlistIdentityKeys, setWishlistIdentityKeys] = useState(new Set())
+  const [activeSavedFilterId, setActiveSavedFilterId] = useState('')
+  const [savedFilterDeleteStateById, setSavedFilterDeleteStateById] = useState({})
+  // Banner card dimensions for Grid sizing — derived from the same
+  // resolved template BannerTemplateProvider already computed once for
+  // <GameBanner> (see src/theme/BannerTemplateProvider.jsx), rather than
+  // App.jsx independently re-fetching/resolving its own copy via IPC.
+  // Legacy (pre-layout-schema) templates don't carry width/height, so they
+  // fall back to the classic default — same behavior as before this was
+  // centralized.
+  const selectedBannerTemplate = useBannerTemplate()
+  const bannerSize = useMemo(() => {
+    const layout = selectedBannerTemplate?.type === 'layout' ? selectedBannerTemplate.value : null
+    const total = getBannerTotalSize(layout || {})
+    return {
+      bannerWidth: total.width,
+      bannerHeight: total.height,
+      shadowEnabled: layout?.shadow?.enabled === true,
+    }
+  }, [selectedBannerTemplate])
+  const [importStatus, setImportStatus] = useState({ text: '', progress: 0, total: 0 })
+  const [importProgress, setImportProgress] = useState({ text: '', progress: 0, total: 0 })
+  const [dbUpdateStatus, setDbUpdateStatus] = useState({ text: '', progress: 0, total: 0 })
+  const [refreshLibraryModalOpen, setRefreshLibraryModalOpen] = useState(false)
+  const [refreshLibraryBusy, setRefreshLibraryBusy] = useState(false)
+  const [refreshLibraryProgress, setRefreshLibraryProgress] = useState(null)
+  // The nav UPDATES button opens this chooser now rather than the metadata
+  // refresh directly — see LibraryUpdateModal.jsx for why the new entries could
+  // not just become two more radios on that dialog.
+  const [libraryUpdateModalOpen, setLibraryUpdateModalOpen] = useState(false)
+  // The "update all games" walkthrough. Separate from the chooser because the
+  // chooser closes the moment a choice is made and the run outlives it.
+  const [updateAllOpen, setUpdateAllOpen] = useState(false)
+  const installFlowRef = useRef(null)
+  // NSFW / adult-content ("Browse mode") opt-in — see electron/ipc/settings.js
+  // get-nsfw-status / set-nsfw-enabled. nsfwPromptOpen drives the first-run
+  // confirmation modal below; it only opens once getNsfwStatus() reports the
+  // user has never been asked (i.e. the config.ini has no [NSFW] enabled
+  // line yet), not just whenever it's currently false.
+  const [nsfwEnabled, setNsfwEnabled] = useState(false)
+  const [nsfwPromptOpen, setNsfwPromptOpen] = useState(false)
+  // About modal + first-run interactive welcome tour. The tour is shown
+  // once (persisted in localStorage under WELCOME_TOUR_SEEN_KEY) and can be
+  // re-launched from the About modal.
+  const [aboutOpen, setAboutOpen] = useState(false)
+  // Configurable version link destination mode:
+  // 'releases' - always point to main releases page
+  // 'channel-latest' - point to latest release of current channel (stable/nightly)
+  // 'specific' - point to specific version release (default/current behavior)
+  const [versionLinkMode, setVersionLinkMode] = useState('specific')
+  // Extract appUpdateBranch from Interface settings for version link logic
+  const [appUpdateBranch, setAppUpdateBranch] = useState(() => {
+    // Default to stable, will be updated when config loads
+    return 'stable'
+  })
+  
+  // Helper function to build the version URL based on mode and current state
+  const buildVersionUrl = useCallback((versionStr) => {
+    if (!versionStr) return 'https://github.com/towerwatchman/Atlas/releases'
+    
+    switch (versionLinkMode) {
+      case 'releases':
+        // Always point to main releases page
+        return 'https://github.com/towerwatchman/Atlas/releases'
+      case 'channel-latest':
+        // Point to latest release of current channel
+        if (appUpdateBranch === 'nightly') {
+          return 'https://github.com/towerwatchman/Atlas/releases#release-v0.9.9-nightly.459'
+        }
+        return 'https://github.com/towerwatchman/Atlas/releases'
+      case 'specific':
+      default:
+        // Point to specific version release
+        return `https://github.com/towerwatchman/Atlas/releases/tag/v${versionStr}`
+    }
+  }, [versionLinkMode, appUpdateBranch])
+  // Passive audit banner: shows when the remote has removed catalog entries
+  // that local games were mapped to (count > 0). Dismissable for the session.
+  const [invalidMappingCount, setInvalidMappingCount] = useState(0)
+  const [mappingBannerDismissed, setMappingBannerDismissed] = useState(false)
+  // Passive banner for duplicate games that can be merged (multiple local
+  // records sharing one atlas_id, e.g. Steam seasons). Dismissable for session.
+  const [mergeableCount, setMergeableCount] = useState(0)
+  const [mergeBannerDismissed, setMergeBannerDismissed] = useState(false)
+  const [showWelcomeTour, setShowWelcomeTour] = useState(false)
+  // True while the tour is running as part of the first-run flow (not a replay
+  // from About). When such a tour ends, we chain into the settings tour.
+  const firstRunTourRef = useRef(false)
+  // First-run welcome page (own flag, checked separately from the age
+  // prompt). The refs coordinate the first-run sequence: welcome ->
+  // (age confirmation if needed) -> interactive tour.
+  const [showWelcome, setShowWelcome] = useState(false)
+  const ageNeedsPromptRef = useRef(false)
+  const startTourAfterAgeRef = useRef(false)
+
+  const gridRef = useRef(null)
+  const gameGridRef = useRef(null)
+  const libraryScrollTopRef = useRef(0)
+  // Tracks the {search, filters} combination of the last catalog fetch
+  // actually dispatched (by either browseCatalog's immediate first-load
+  // path or the debounced reset effect below) so re-entering Browse mode
+  // without anything having changed doesn't wipe and reload data that's
+  // already correct.
+  const lastFetchedCatalogParamsKeyRef = useRef(null)
+  const pendingLibraryScrollTopRestoreRef = useRef(null)
+  const dbUpdateRunningRef = useRef(false)
+  const showGameList = sidebarMode === SIDE_PANEL_MODES.GAMES
+  const showSavedFilters = sidebarMode === SIDE_PANEL_MODES.SAVED_FILTERS
+  const showLibrarySidebar = showGameList || showSavedFilters
+  // Browse mode (the adult-content catalog) requires BOTH the build-time
+  // BROWSE_MODE_ENABLED flag (electron/features.js — currently off pending
+  // legal review) AND the user's own per-install NSFW opt-in. Either one
+  // being off hides/disables Browse mode entirely.
+  const browseAvailable = BROWSE_MODE_ENABLED && nsfwEnabled
+  // Mirrors browseAvailable into a ref so the mount-only IPC-listener effect
+  // below (deps: []) can read the latest value without becoming stale —
+  // that effect's handlers are created once and never recreated, but
+  // nsfwEnabled (and therefore browseAvailable) can change at runtime via
+  // the Settings toggle.
+  const browseAvailableRef = useRef(browseAvailable)
+  useEffect(() => { browseAvailableRef.current = browseAvailable }, [browseAvailable])
+
+  // The user's default search scope ([Search] defaultFields). Held in state only
+  // so the scope picker can render "Reset to my default" and highlight it; the
+  // value the filter layer actually consults is the module-level default in
+  // useFilters.js, set by setDefaultSearchFieldIds below.
+  const [defaultSearchFieldIds, setDefaultSearchFieldIdsState] = useState(
+    () => [...DEFAULT_SEARCH_FIELD_IDS],
+  )
+
+  const applyDefaultSearchFields = useCallback((value) => {
+    const next = normalizeSearchFieldIds(value, DEFAULT_SEARCH_FIELD_IDS)
+    setDefaultSearchFieldIds(next)
+    setDefaultSearchFieldIdsState(next)
+    return next
+  }, [])
+
+  const setAndPersistSidePanelMode = useCallback((requestedMode) => {
+    const nextMode = normalizeSidePanelMode(requestedMode, undefined, browseAvailable)
+    setSidebarMode(nextMode)
+    window.electronAPI
+      .getConfig()
+      .then((config) => {
+        window.electronAPI.saveSettings({
+          ...config,
+          Interface: {
+            ...config.Interface,
+            sidePanelMode: nextMode,
+            showGameList:
+              nextMode !== SIDE_PANEL_MODES.HIDDEN &&
+              nextMode !== SIDE_PANEL_MODES.CATALOG &&
+              nextMode !== SIDE_PANEL_MODES.WISHLIST,
+          },
+        })
+      })
+      .catch((err) => console.error('Failed to save side panel mode:', err))
+  }, [browseAvailable])
+
+  // ── Hooks ──────────────────────────────────────────────────────────────────
+  const {
+    games, catalogGames, wishlistGames, totalVersions, fetchGames, fetchCatalogGames,
+    requestCatalogRange, catalogLoading, catalogLoadingMore,
+    catalogTotal, catalogLoadError, catalogIndexState,
+    gamesLoading, wishlistLoading, libraryStats, libraryStatsStale,
+    fetchWishlistGames, replaceGameInState,
+    removeGameFromState, refreshGame, includeUninstalledRef,
+  } = useGames()
+
+  // ── Collections ────────────────────────────────────────────────────────────
+  // Local-library only: catalog and wishlist entries have no games.record_id to
+  // hang membership off, so the collections button and grouping are hidden in
+  // those modes and Browse keeps the list it already had.
+  const {
+    collections, artRecordIds, collectionIdsByRecord, recordIdsByCollection,
+    loading: collectionsLoading, refresh: refreshCollections,
+  } = useCollections({ enabled: true })
+  // 'grid' is the normal library; 'collections' is the tile screen.
+  const [libraryView, setLibraryView] = useState('grid')
+  const [collectionModal, setCollectionModal] = useState(null)
+  const [collectionModalBusy, setCollectionModalBusy] = useState(false)
+  const [collectionModalError, setCollectionModalError] = useState('')
+  const [expandedCollectionIds, setExpandedCollectionIds] = useState(() => new Set())
+  const [pendingCollectionDelete, setPendingCollectionDelete] = useState(null)
+  const [bulkTagTarget, setBulkTagTarget] = useState(null)
+  // Set when "Rate Game" is chosen from a context menu. The modal itself lives on
+  // the detail page, so the grid has to navigate there and hand off a request.
+  const [pendingRatingRecordId, setPendingRatingRecordId] = useState(null)
+  // Custom context menu state. Replaces the native menu for game rows so Play can
+  // be styled and can both launch and list versions from one row.
+  const [gameMenu, setGameMenu] = useState(null)
+  // Tile art comes back from the DB as record ids; resolve them against the
+  // already-loaded library rather than refetching art per collection.
+  const gamesByRecordId = useMemo(() => {
+    const map = new Map()
+    for (const game of games) if (game) map.set(Number(game.record_id), game)
+    return map
+  }, [games])
+  // Which records the bulk dialog will touch, and the tags already present
+  // across them. The "remove" field suggests from the latter rather than the
+  // whole library, since library-wide tags mostly cannot be removed here.
+  const bulkTagRecordIds = useMemo(() => {
+    if (!bulkTagTarget?.id) return []
+    return [...(recordIdsByCollection.get(Number(bulkTagTarget.id)) || [])]
+  }, [bulkTagTarget, recordIdsByCollection])
+  const bulkTagPresentTags = useMemo(() => {
+    if (bulkTagRecordIds.length === 0) return []
+    const seen = new Map()
+    for (const recordId of bulkTagRecordIds) {
+      const game = gamesByRecordId.get(Number(recordId))
+      if (!game) continue
+      const merged = [game.tags, game.f95_tags, game.lewdcornerTags]
+        .filter(Boolean)
+        .join(',')
+      for (const raw of merged.split(/[,;|]/)) {
+        const tag = raw.trim()
+        if (!tag) continue
+        const key = tag.toLowerCase()
+        if (!seen.has(key)) seen.set(key, tag)
+      }
+    }
+    return [...seen.values()].sort((a, b) => a.localeCompare(b))
+  }, [bulkTagRecordIds, gamesByRecordId])
+
+  const {
+    activeFilters, handleFilterChange, handleResetFilters,
+    filteredGames: localFilteredGames, installedGameCount, uninstalledGameCount,
+  } = useFilters(games, includeUninstalledRef, fetchGames, setSelectedGame, { collectionIdsByRecord })
+  const catalogWithWishlist = useMemo(
+    () => withWishlistStates(catalogGames, wishlistIdentityKeys),
+    [catalogGames, wishlistIdentityKeys],
+  )
+  const catalogLoadedCount = useMemo(
+    () => catalogGames.reduce((count, game) => count + (game ? 1 : 0), 0),
+    [catalogGames],
+  )
+  const wishlistWithState = useMemo(
+    () => withWishlistStates(wishlistGames, wishlistIdentityKeys),
+    [wishlistGames, wishlistIdentityKeys],
+  )
+  // Resolved here rather than in the main process: the configured default lives
+  // in the renderer's config read, and Browse must search the same fields the
+  // Library does. `type` is still sent for a mismatched main/renderer pair.
+  const catalogSearchFields = resolveSearchFieldIds(activeFilters)
+  const catalogSearchFieldsKey = catalogSearchFields.join(',')
+  const catalogSearch = useMemo(
+    () => makeCatalogSearch(activeFilters),
+    // Keyed on the joined string so a new-but-equal array doesn't refire the
+    // catalog fetch; see lastFetchedCatalogParamsKeyRef below. activeFilters is
+    // deliberately NOT a dependency: only the three values makeCatalogSearch
+    // reads matter, and depending on the whole object would rebuild the search
+    // on any unrelated filter change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeFilters.text, activeFilters.type, catalogSearchFieldsKey],
+  )
+  const catalogQueryFilters = useMemo(
+    () => activeFilters,
+    [activeFilters],
+  )
+  const catalogSearchRef = useRef(catalogSearch)
+  const catalogQueryFiltersRef = useRef(catalogQueryFilters)
+  useEffect(() => {
+    catalogSearchRef.current = catalogSearch
+  }, [catalogSearch])
+  useEffect(() => {
+    catalogQueryFiltersRef.current = catalogQueryFilters
+  }, [catalogQueryFilters])
+  // Catalog/Browse rows come back from the server already filtered and
+  // sorted (see electron/db/versions.js getCatalogGames) — catalogGames is
+  // re-filtered here for nothing else, just annotated with wishlist state,
+  // so its array indices stay aligned 1:1 with the server's absolute
+  // result positions (which is what requestCatalogRange's windowed
+  // loading relies on; re-filtering client-side would shift indices and
+  // break that alignment, in addition to being redundant work).
+  const wishlistFilteredGames = useMemo(
+    () =>
+      filterGamesWithState(wishlistWithState, {
+        ...activeFilters,
+        includeUninstalled: true,
+        installState: 'all',
+        updateAvailable: false,
+        multipleInstalledVersions: false,
+        browseDateRange: 'any',
+      }),
+    [wishlistWithState, activeFilters],
+  )
+  const filteredGames =
+    libraryMode === 'catalog'
+      ? catalogWithWishlist
+      : libraryMode === 'wishlist'
+        ? wishlistFilteredGames
+        : localFilteredGames
+  // The library grid must not claim to be empty while data is still arriving, nor
+  // when the database reports records that are not in state yet. get-games has to
+  // resolve every record's version list before it returns, so on a large library
+  // there is a real window with no data — and "No games available" in that window
+  // reads as a lost library. The stats probe (three indexed COUNT(*)s) resolves
+  // well before get-games, so the real total is usually known on first render.
+  const expectedLibraryCount = libraryStats?.games || 0
+  const libraryIsLoading =
+    libraryMode === 'wishlist' ? wishlistLoading : libraryMode === 'local' && gamesLoading
+  // The fetch finished, returned nothing, and yet the database reports records.
+  // Deliberately NOT folded into the spinner condition above: that would spin
+  // forever on a failed fetch. This is a genuine anomaly, so it gets its own
+  // message and a retry rather than an animation that never ends.
+  // Deliberately silent while the count is being re-read. The list and the
+  // count come from two separate queries, so a membership change makes them
+  // disagree for real until the re-count lands — and "reports 1 game, none
+  // returned" is exactly what deleting your last game looks like mid-flight.
+  const libraryLoadMismatch =
+    libraryMode === 'local' && !gamesLoading && !libraryStatsStale
+    && games.length === 0 && expectedLibraryCount > 0
+  // Distinguishes "your filters match nothing" from "you have no games", which
+  // the single 'No games available' string used to conflate.
+  const hasActiveLibraryFilters = Boolean(
+    activeFilters?.text ||
+    activeSavedFilterId ||
+    (activeFilters?.tags?.length || 0) > 0 ||
+    (activeFilters?.category?.length || 0) > 0 ||
+    (activeFilters?.engine?.length || 0) > 0 ||
+    (activeFilters?.status?.length || 0) > 0,
+  )
+  // The collection currently being viewed, if the filter holds exactly one.
+  const activeCollection =
+    (activeFilters?.collectionIds?.length || 0) === 1
+      ? collections.find((c) => String(c.id) === String(activeFilters.collectionIds[0])) || null
+      : null
+  const viewTitle =
+    libraryMode === 'catalog'
+      ? 'Browse'
+      : libraryMode === 'wishlist'
+        ? 'Wishlist'
+        : 'Games'
+
+  const { isMaximized, version, handleWindowStateChanged, loadVersion } = useWindowState()
+  const { theme, layout, accentBarEnabled, filterSidebarSide, filterSidebarMode, logoVariant } = useTheme()
+  const isTopNav = layout === 'topnav'
+  // The Favorites nav button is a filtered LOCAL view (built-in saved
+  // filter), not its own libraryMode — so its active state must track that
+  // filter being applied, not libraryMode === 'local' (which is the normal
+  // library too, and made the button look permanently active).
+  const favoritesActive = activeSavedFilterId === 'builtin-favorites' && libraryMode === 'local'
+  // Active on the tile screen AND while viewing inside a collection, since
+  // both are "you are in collections" as far as the button is concerned.
+  const collectionsActive =
+    libraryMode === 'local' &&
+    (libraryView === 'collections' || (activeFilters?.collectionIds?.length || 0) > 0)
+
+  const toast = useToast()
+  const {
+    appUpdateNotice, setAppUpdateNotice, appUpdateActionBusy,
+    handleUpdateStatus, handleAppUpdateAction,
+  } = useAppUpdate(setDbUpdateStatus)
+  const appUpdateNoticeText =
+    sanitizeFooterToastText(
+      appUpdateNotice.status === 'downloading' &&
+      appUpdateNotice.percent !== undefined &&
+      appUpdateNotice.percent !== null
+        ? `Downloading Atlas update: ${formatPercent(appUpdateNotice.percent)}`
+        : appUpdateNotice.text,
+      'app-update-message',
+    )
+  const appUpdateActionLabel = sanitizeFooterToastText((() => {
+    if (appUpdateNotice.status === 'installing') return 'Installing update...'
+    if (appUpdateNotice.status === 'downloaded') return 'Install and restart'
+    if (appUpdateNotice.status === 'downloading') return 'Downloading...'
+    if (appUpdateNotice.status === 'checking') return 'Checking...'
+    if (['error', 'package_not_ready', 'not-available'].includes(appUpdateNotice.status)) {
+      return 'Check for updates'
+    }
+    return 'Download and install'
+  })(), 'app-update-action')
+  const isAppUpdateActionDisabled =
+    (appUpdateActionBusy && appUpdateNotice.status !== 'downloaded') ||
+    ['downloading', 'checking', 'installing'].includes(appUpdateNotice.status)
+
+  // Bridge the app-update notice into the toast system (replaces the old
+  // full-width bottom bar). One toast, updated in place by id as the update
+  // transitions checking -> downloading -> downloaded -> installing. It stays
+  // sticky (no auto-dismiss) because it carries the install/restart action;
+  // dismissing hides it and syncs the underlying notice state.
+  useEffect(() => {
+    if (!appUpdateNotice.visible) {
+      toast.dismiss('app-update')
+      return
+    }
+    const variant =
+      ['error', 'package_not_ready'].includes(appUpdateNotice.status) ? 'error'
+        : appUpdateNotice.status === 'not-available' ? 'success'
+        : appUpdateNotice.status === 'downloaded' ? 'success'
+        : 'info'
+    // Show the action button only for states where it does something useful.
+    const actionableStatuses = ['available', 'downloaded', 'error', 'package_not_ready', 'not-available']
+    const showAction = actionableStatuses.includes(appUpdateNotice.status)
+    toast.notify({
+      id: 'app-update',
+      variant,
+      title: 'Atlas Update',
+      message: appUpdateNoticeText,
+      progress: appUpdateNotice.status === 'downloading' && appUpdateNotice.percent != null
+        ? Number(appUpdateNotice.percent)
+        : null,
+      action: showAction ? {
+        label: appUpdateActionLabel,
+        onClick: handleAppUpdateAction,
+        busy: isAppUpdateActionDisabled,
+        disabled: isAppUpdateActionDisabled,
+      } : null,
+      dismissible: true,
+      // When the user closes the toast, hide the underlying notice too so the
+      // effect doesn't immediately recreate it.
+      onDismiss: () => setAppUpdateNotice((n) => ({ ...n, visible: false })),
+      // Transient informational states auto-dismiss; actionable/progress ones stay.
+      duration: ['not-available'].includes(appUpdateNotice.status) ? 8000 : 0,
+    })
+  }, [
+    appUpdateNotice.visible, appUpdateNotice.status, appUpdateNotice.percent,
+    appUpdateNoticeText, appUpdateActionLabel, isAppUpdateActionDisabled,
+    handleAppUpdateAction, toast,
+  ])
+
+  // Show a dismissible warning toast when an image source gets rate-limited
+  // during import/refresh. Downloads from that source pause for the rest of the
+  // run; other sources keep going. De-duplicated per source via a stable id.
+  useEffect(() => {
+    const off = window.electronAPI.onMediaRateLimited?.((data) => {
+      const source = data?.source || 'a source'
+      const pretty = { f95: 'F95zone', steam: 'Steam', gog: 'GOG', lewdcorner: 'LewdCorner', lc: 'LewdCorner' }[source] || source
+      const retryMs = Number(data?.retryAfterMs)
+      const retryNote = Number.isFinite(retryMs) && retryMs > 0
+        ? ` Try again in ~${Math.ceil(retryMs / 1000)}s.`
+        : ''
+      toast.warning('Image downloads paused', {
+        id: `rate-limit-${source}`,
+        message: `${pretty} is rate-limiting image downloads, so they've been paused for this run. Other sources continue.${retryNote}`,
+        duration: 0,
+      })
+    })
+    return () => { if (typeof off === 'function') off() }
+  }, [toast])
+
+  // Report the startup custom-metadata repair, if it changed anything.
+  //
+  // The repair runs before this window exists, so it cannot be pushed to us —
+  // we pull it once on mount and the main process clears it on read, so the
+  // notice appears exactly once per launch. A silent bulk change to the user's
+  // own data should not go unannounced.
+  useEffect(() => {
+    let cancelled = false
+    const fetchSummary = window.electronAPI.getStartupRepairSummary
+    if (typeof fetchSummary !== 'function') return undefined
+
+    fetchSummary()
+      .then((summary) => {
+        if (cancelled || !summary || !summary.repairedFields) return
+        const { repairedFields, titleCount, blankedFields, redundantFields, sampleTitles } = summary
+        const n = (v) => Number(v || 0).toLocaleString()
+        const plural = (v, one, many) => (v === 1 ? one : many)
+
+        // Name the title when only one was affected — shorter and more useful
+        // than "across 1 title".
+        const onlyTitle = titleCount === 1 ? (sampleTitles || [])[0] : null
+        const scope = onlyTitle
+          ? `on ${onlyTitle}`
+          : `across ${n(titleCount)} ${plural(titleCount, 'title', 'titles')}`
+
+        // Lead with what the user actually notices — fields that were showing
+        // blank are showing their real values again — then the tidy-up.
+        const details = []
+        if (blankedFields > 0) {
+          details.push(
+            `${n(blankedFields)} ${plural(blankedFields, 'was', 'were')} blank and ` +
+            `${plural(blankedFields, 'now shows', 'now show')} source data again`,
+          )
+        }
+        if (redundantFields > 0) {
+          details.push(
+            `${n(redundantFields)} matched the source and ${plural(redundantFields, 'is', 'are')} ` +
+            'no longer pinned as custom',
+          )
+        }
+
+        toast.success('Library data repaired', {
+          id: 'startup-metadata-repair',
+          message:
+            `Fixed ${n(repairedFields)} ${plural(repairedFields, 'field', 'fields')} ${scope} ` +
+            `that had been saved as custom values by mistake. ${details.join('; ')}.`,
+          // Sticky: this is a one-time change to their data, worth an explicit
+          // dismissal rather than vanishing after a few seconds.
+          duration: 0,
+        })
+      })
+      .catch((err) => console.warn('Could not read startup repair summary:', err))
+
+    return () => { cancelled = true }
+  }, [toast])
+
+  // ── Scroll restore ─────────────────────────────────────────────────────────
+  const restoreLibraryScrollIfNeeded = useCallback(() => {
+    const targetScrollTop = pendingLibraryScrollTopRestoreRef.current
+    if (targetScrollTop === null || targetScrollTop === undefined) return
+    let attempts = 0
+    const tryRestore = () => {
+      const grid = gridRef.current
+      if (grid?.scrollToPosition) {
+        grid.recomputeGridSize?.()
+        grid.scrollToPosition({ scrollTop: targetScrollTop })
+        // forceUpdate is the important part. Without it react-virtualized keeps
+        // the cell range it rendered for the PREVIOUS dataset — coming back from
+        // Browse left the top rows blank while lower rows, which happened to
+        // overlap the stale range, still painted. Scrolling alone does not
+        // invalidate that range.
+        grid.forceUpdate?.()
+        // rowCount for the library can land a frame after this runs, so
+        // re-measure once more on the next frame.
+        requestAnimationFrame(() => {
+          gridRef.current?.recomputeGridSize?.()
+          gridRef.current?.forceUpdate?.()
+        })
+        libraryScrollTopRef.current = targetScrollTop
+        pendingLibraryScrollTopRestoreRef.current = null
+        return
+      }
+      attempts += 1
+      if (attempts < 10) requestAnimationFrame(tryRestore)
+    }
+    requestAnimationFrame(tryRestore)
+  }, [])
+
+  const goBackToLibrary = useCallback(() => {
+    pendingLibraryScrollTopRestoreRef.current = libraryScrollTopRef.current || 0
+    setSelectedGame(null)
+  }, [])
+
+  const goHome = useCallback(() => {
+    setLibraryMode('local')
+    setLibraryView('grid')
+    // Inlined rather than calling clearCollectionFilter(), which is declared
+    // further down — handleFilterChange is already in scope here.
+    handleFilterChange({ collectionIds: [] })
+    if (sidebarMode === SIDE_PANEL_MODES.CATALOG || sidebarMode === SIDE_PANEL_MODES.WISHLIST) {
+      setAndPersistSidePanelMode(SIDE_PANEL_MODES.HIDDEN)
+    }
+    // If a built-in/saved filter is applied (e.g. Favorites, which is a
+    // filtered local view rather than its own libraryMode), clear it and
+    // reset to the default library — otherwise "go home"/Library would
+    // leave the still-filtered subset showing and you couldn't get back to
+    // the full library.
+    if (activeSavedFilterId) {
+      setActiveSavedFilterId('')
+      handleResetFilters()
+    }
+    goBackToLibrary()
+  }, [goBackToLibrary, setAndPersistSidePanelMode, sidebarMode, activeSavedFilterId, handleResetFilters, handleFilterChange])
+
+
+  // ── Collection handlers ────────────────────────────────────────────────────
+  // Expand/collapse state is a UI preference, persisted alongside the other
+  // Interface settings so the tree comes back the way it was left.
+  const persistExpandedCollections = useCallback((expandedSet) => {
+    const ids = [...expandedSet]
+    window.electronAPI.getConfig?.()
+      .then((config) => window.electronAPI.saveSettings({
+        ...config,
+        Interface: { ...(config?.Interface || {}), expandedCollections: ids.join(',') },
+      }))
+      .catch((err) => console.error('Failed to persist expanded collections:', err))
+  }, [])
+
+  const openCollections = useCallback(() => {
+    setLibraryMode('local')
+    setSelectedGame(null)
+    setLibraryView('collections')
+  }, [])
+
+  // Downloads is a full view rather than an overlay: transfers are long
+  // running and people leave the screen open to watch them, which wants room
+  // for cover art and per-item detail. Same shape as openCollections so the
+  // back-to-library affordances keep working.
+  // The mirror picker lives here, not on the detail page, so it sits above
+  // whatever view is open. Update All walks a list of games and swaps the
+  // target underneath the same modal; a page-owned modal would force a
+  // navigation per game and drag the detail view along with it.
+  const [updateModalGame, setUpdateModalGame] = useState(null)
+  const openUpdateModal = useCallback((game) => { if (game) setUpdateModalGame(game) }, [])
+
+  const openDownloads = useCallback(() => {
+    setLibraryMode('local')
+    setSelectedGame(null)
+    setLibraryView('downloads')
+  }, [])
+
+  // Opening a collection is a filtered local view, exactly like Favorites: it
+  // sets a filter rather than becoming its own libraryMode, so search and the
+  // rest of the filter sidebar keep working inside a collection.
+  const openCollection = useCallback((collection) => {
+    if (!collection) return
+    setLibraryMode('local')
+    setSelectedGame(null)
+    setLibraryView('grid')
+    setActiveSavedFilterId('')
+    handleFilterChange({
+      collectionIds: [String(collection.id)],
+      includeUninstalled: true,
+      installState: 'all',
+    })
+  }, [handleFilterChange])
+
+  const clearCollectionFilter = useCallback(() => {
+    handleFilterChange({ collectionIds: [] })
+  }, [handleFilterChange])
+
+  const toggleCollectionExpanded = useCallback((groupId) => {
+    setExpandedCollectionIds((previous) => {
+      const next = new Set(previous)
+      if (next.has(groupId)) next.delete(groupId)
+      else next.add(groupId)
+      persistExpandedCollections(next)
+      return next
+    })
+  }, [])
+
+  const closeCollectionModal = useCallback(() => {
+    setCollectionModal(null)
+    setCollectionModalError('')
+    setCollectionModalBusy(false)
+  }, [])
+
+  const submitCollectionModal = useCallback(async ({ name, color }) => {
+    if (!collectionModal) return
+    setCollectionModalBusy(true)
+    setCollectionModalError('')
+    try {
+      if (collectionModal.mode === 'rename') {
+        const result = await window.electronAPI.renameCollection({
+          collectionId: collectionModal.collectionId, name,
+        })
+        if (!result?.success) {
+          setCollectionModalError(result?.error || 'Failed to rename collection')
+          return
+        }
+        if (color) {
+          await window.electronAPI.setCollectionColor({
+            collectionId: collectionModal.collectionId, color,
+          })
+        }
+      } else {
+        const result = await window.electronAPI.createCollection({ name, color })
+        if (!result?.success) {
+          setCollectionModalError(result?.error || 'Failed to create collection')
+          return
+        }
+        // Created from a game's context menu: drop that game straight in, which
+        // is the whole point of "Add to -> + New Collection".
+        if (collectionModal.recordId) {
+          await window.electronAPI.addGameToCollection({
+            collectionId: result.id, recordId: collectionModal.recordId,
+          })
+        }
+      }
+      closeCollectionModal()
+      refreshCollections()
+    } catch (err) {
+      setCollectionModalError(err?.message || 'Something went wrong')
+    } finally {
+      setCollectionModalBusy(false)
+    }
+  }, [collectionModal, closeCollectionModal, refreshCollections])
+
+  const deleteCollection = useCallback(async (collection) => {
+    if (!collection) return
+    const result = await window.electronAPI.deleteCollection(collection.id)
+    if (!result?.success) {
+      toast.error('Could not delete collection', { message: result?.error || 'Unknown error' })
+      return
+    }
+    // Titles in a deleted collection fall back to Uncategorized rather than
+    // being removed, so say so — deleting a "collection" shouldn't read as
+    // deleting games.
+    toast.success(`Deleted "${collection.name}"`, {
+      message: 'Its titles are now uncategorized.',
+    })
+    if (activeFilters.collectionIds?.includes(String(collection.id))) clearCollectionFilter()
+    refreshCollections()
+  }, [toast, activeFilters.collectionIds, clearCollectionFilter, refreshCollections])
+
+  // Right-clicking a tile on the collections screen. Rename and delete need a
+  // renderer dialog, so those entries round-trip back through
+  // collection-rename-requested / collection-delete-requested.
+  const handleCollectionContextMenu = useCallback((collection) => {
+    if (!collection) return
+    window.electronAPI.showContextMenu([
+      {
+        label: 'Rename',
+        data: {
+          action: 'collectionRenameRequested',
+          collectionId: collection.id,
+          name: collection.name,
+          color: collection.color,
+        },
+      },
+      {
+        label: 'Tag All Games…',
+        data: {
+          action: 'collectionBulkTagRequested',
+          collectionId: collection.id,
+          name: collection.name,
+        },
+      },
+      { type: 'separator' },
+      {
+        label: 'Delete Collection',
+        data: {
+          action: 'collectionDeleteRequested',
+          collectionId: collection.id,
+          name: collection.name,
+        },
+      },
+    ])
+  }, [])
+
+  // One opener for the grid and the tree, so both menus are identical.
+  const openGameContextMenu = useCallback((game, event) => {
+    if (!game) return
+    const items = buildGameContextMenu({ game, collections, collectionIdsByRecord })
+    if (items.length === 0) return
+    setGameMenu({ x: event?.clientX ?? 0, y: event?.clientY ?? 0, items })
+  }, [collections, collectionIdsByRecord])
+
+  // Routed through the main process so the custom menu and the remaining native
+  // menus share handleContextAction — confirmations and delete safeguards
+  // included.
+  const runGameContextAction = useCallback((data) => {
+    window.electronAPI.runContextAction?.(data)
+  }, [])
+
+  const selectGame = useCallback((game) => {
+    setShowSearchSidebar(false)
+    const selected = withWishlistStates([game], wishlistIdentityKeys)[0] || game
+    setSelectedGame(selected)
+    const localRecordId = game?.isMetadataOnly ? getLocalRecordIdForCatalogRow(selected) : null
+    const recordIdToLoad = localRecordId || game?.record_id
+    if (!recordIdToLoad || (game.isMetadataOnly && !localRecordId)) {
+      if (game?.isMetadataOnly && (game.is_installed || game.isInstalled) && !localRecordId) {
+        console.warn('Installed metadata row is missing a local record id:', game)
+      }
+      return
+    }
+    window.electronAPI
+      .getGame(recordIdToLoad)
+      .then((updatedGame) => {
+        const normalizedGame = normalizeGameForRenderer(updatedGame)
+        if (normalizedGame) {
+          setShowSearchSidebar(false)
+          setSelectedGame(localRecordId
+            ? {
+                ...normalizedGame,
+                isWishlisted: selected.isWishlisted === true || selected.isWishlistEntry === true,
+                isWishlistEntry: selected.isWishlisted === true || selected.isWishlistEntry === true,
+                atlas_id: normalizedGame.atlas_id ?? selected.atlas_id,
+                f95_id: normalizedGame.f95_id ?? selected.f95_id,
+                lc_id: normalizedGame.lc_id ?? selected.lc_id,
+                steam_id: normalizedGame.steam_id ?? selected.steam_id,
+              }
+            : (withWishlistStates([normalizedGame], wishlistIdentityKeys)[0] || normalizedGame))
+        }
+      })
+      .catch((error) =>
+        console.error(`Failed to refresh selected game ${recordIdToLoad}:`, error)
+      )
+  }, [wishlistIdentityKeys])
+
+  // Opens the rating modal for a title chosen from a context menu in the grid or
+  // tree. Real dependencies, so it sees the current games list rather than the
+  // empty one captured when the listeners were registered.
+  useEffect(() => {
+    if (!pendingRatingRecordId) return
+    if (selectedGame?.record_id === pendingRatingRecordId) return
+    const target = gamesByRecordId.get(Number(pendingRatingRecordId))
+    if (target) selectGame(target)
+    // No match (e.g. filtered out of the current view): drop the request rather
+    // than leaving it pending and firing on some unrelated later navigation.
+    else setPendingRatingRecordId(null)
+  }, [pendingRatingRecordId, selectedGame?.record_id, gamesByRecordId, selectGame])
+
+  const refreshDetailGame = useCallback((recordId) => {
+    refreshGame(recordId)
+    if (browseAvailable) fetchCatalogGames({ search: catalogSearch, filters: catalogQueryFilters })
+    fetchWishlistGames()
+    const id = Number.parseInt(recordId, 10)
+    if (!Number.isInteger(id) || id <= 0) return
+    window.electronAPI
+      .getGame(id)
+      .then((updatedGame) => {
+        const normalizedGame = normalizeGameForRenderer(updatedGame)
+        if (!normalizedGame) return
+        setSelectedGame((current) => {
+          if (Number.parseInt(current?.record_id, 10) !== id) return current
+          return {
+            ...normalizedGame,
+            isWishlisted: current?.isWishlisted === true || current?.isWishlistEntry === true,
+            isWishlistEntry: current?.isWishlisted === true || current?.isWishlistEntry === true,
+          }
+        })
+      })
+      .catch((error) =>
+        console.error(`Failed to refresh detail game ${id}:`, error)
+      )
+  }, [browseAvailable, catalogQueryFilters, catalogSearch, fetchCatalogGames, fetchWishlistGames, refreshGame])
+
+  // ── Grid sizing ────────────────────────────────────────────────────────────
+  // #gameGrid no longer scrolls (it is a flex column; see the container below),
+  // so AutoSizer's measured width is the FULL pane width. The virtualized Grid
+  // draws its own always-on scrollbar inside that width, so its thickness has
+  // to come off before the column count is worked out -- otherwise the last
+  // column is computed into space the scrollbar occupies and gets clipped.
+  //
+  // Read from --scrollbar-size rather than hardcoded, so the CSS that draws the
+  // scrollbar and the arithmetic that budgets for it cannot drift apart.
+  const scrollbarSize = useMemo(() => {
+    if (typeof window === 'undefined' || !document?.documentElement) return 12
+    const raw = window.getComputedStyle(document.documentElement)
+      .getPropertyValue('--scrollbar-size')
+    const parsed = Number.parseFloat(raw)
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 12
+  }, [])
+
+  const getColumnCountForWidth = (width) => {
+    const availableWidth = Math.max(0, Number(width) || 0)
+    return Math.max(1, Math.floor(availableWidth / (bannerSize.bannerWidth + 16)))
+  }
+
+  const debounceResize = debounce(() => {
+    if (gridRef.current) {
+      gridRef.current.recomputeGridSize()
+      gridRef.current.forceUpdate()
+    }
+  }, 16)
+
+  // Re-measure the Grid whenever the resolved banner card size changes —
+  // covers the initial resolution, picking a different template/layout in
+  // Settings, and live theme-builder edits broadcast from another window
+  // (all of which now flow through BannerTemplateProvider, see
+  // src/theme/BannerTemplateProvider.jsx). Previously this recompute was
+  // triggered manually at the end of loadBannerLayoutMetrics(); it's now
+  // just a reaction to bannerSize itself.
+  useEffect(() => {
+    requestAnimationFrame(() => {
+      gridRef.current?.recomputeGridSize?.()
+      gridRef.current?.forceUpdate?.()
+    })
+  }, [bannerSize.bannerWidth, bannerSize.bannerHeight])
+
+  const getCellRenderer = (currentColumnCount) => ({ columnIndex, rowIndex, style }) => {
+    const index = rowIndex * currentColumnCount + columnIndex
+    if (index >= filteredGames.length) return null
+    const game = filteredGames[index]
+    // Keep library banners decoded so returning from Browse does not flash.
+    // Local mode only: Browse scrolls the whole catalog, and retaining that
+    // would be hundreds of MB of bitmaps for art the user passes through once.
+    if (libraryMode === 'local' && game?.banner_url) {
+      retainImage(toMediaSrc(game.banner_url))
+    }
+    if (!game) {
+      // Not-loaded-yet catalog slot — requestCatalogRange() (driven by the
+      // Grid's onSectionRendered) will fetch the page covering this index
+      // once it's actually scrolled into view; this is just a same-sized
+      // placeholder so the grid doesn't jump around while that happens.
+      return (
+        <div
+          key={`placeholder-${index}`}
+          style={{
+            ...style,
+            display: 'flex',
+            justifyContent: 'center',
+            padding: '8px 4px',
+            maxWidth: '100%',
+          }}
+        >
+          <div
+            className="animate-pulse rounded bg-secondary"
+            style={{ width: bannerSize.bannerWidth, height: bannerSize.bannerHeight }}
+          />
+        </div>
+      )
+    }
+    return (
+      <div
+        key={game.record_id}
+        className="hover:z-20"
+        style={{
+          ...style,
+          display: 'flex',
+          justifyContent: 'center',
+          padding: bannerSize.shadowEnabled ? '16px 12px 32px' : '8px 4px',
+          maxWidth: '100%',
+        }}
+      >
+        <GameBanner
+          game={game}
+          onSelect={() => selectGame(game)}
+          onContextMenu={openGameContextMenu}
+          onOpenUpdate={openUpdateModal}
+        />
+      </div>
+    )
+  }
+
+  // ── Sidebar / list toggle ──────────────────────────────────────────────────
+  const toggleGameList = () => {
+    // Games list is a simple show/hide now that saved filters live in the
+    // filter sidebar rather than a third state of this toggle.
+    setAndPersistSidePanelMode(
+      sidebarMode === SIDE_PANEL_MODES.GAMES
+        ? SIDE_PANEL_MODES.HIDDEN
+        : SIDE_PANEL_MODES.GAMES
+    )
+  }
+
+  // Records the user's answer to the first-run NSFW/adult-content prompt.
+  // Persists immediately via set-nsfw-enabled (which also marks the config
+  // as "configured" so the prompt never reappears), and updates this
+  // window's own state right away rather than waiting on the nsfw-changed
+  // broadcast round-trip.
+  const handleNsfwChoice = useCallback((enabled) => {
+    setNsfwPromptOpen(false)
+    setNsfwEnabled(enabled)
+    // First-run sequence step 2 -> 3: if the age prompt was reached via the
+    // welcome page, launch the interactive tour now that it's been answered.
+    if (startTourAfterAgeRef.current) {
+      startTourAfterAgeRef.current = false
+      firstRunTourRef.current = true
+      setShowWelcomeTour(true)
+    }
+    window.electronAPI.setNsfwEnabled?.(enabled)
+      .catch((err) => console.error('Failed to save NSFW setting:', err))
+  }, [])
+
+  const browseCatalog = useCallback(() => {
+    setLibraryView('grid')
+    if (!browseAvailable) {
+      setLibraryMode('local')
+      setSelectedGame(null)
+      setAndPersistSidePanelMode(SIDE_PANEL_MODES.GAMES)
+      return
+    }
+    const enteringFreshly = libraryMode !== 'catalog'
+    setLibraryMode('catalog')
+    setSelectedGame(null)
+    if (sidebarMode !== SIDE_PANEL_MODES.SAVED_FILTERS) {
+      setAndPersistSidePanelMode(SIDE_PANEL_MODES.CATALOG)
+    }
+    setShowSearchSidebar(false)
+
+    if (enteringFreshly) {
+      // Browse should always open with no filters active — the full
+      // catalog — rather than inheriting whatever filters were active in
+      // the Library view (most commonly the local library's
+      // installed-only default, or a saved filter someone left applied).
+      // This also clears any saved-filter selection so Browse never opens
+      // pre-narrowed to "your library" by accident.
+      setActiveSavedFilterId('')
+      const browseFilters = normalizeFilterState({
+        ...defaultFilters,
+        includeUninstalled: true,
+        installState: 'all',
+      })
+      // Built by the SAME helper the debounced reset effect uses. Hand-rolling
+      // `{text, type}` here left out `fields`, so the pre-marked key never
+      // matched the one the effect computed, the guard below never fired, and
+      // entering Browse always fetched twice - the second one a reset, which
+      // clears catalogGames and shows the full-screen spinner over results that
+      // had already rendered.
+      const browseSearch = makeCatalogSearch(browseFilters)
+      // Update the real activeFilters state (so catalogQueryFilters/
+      // catalogSearch recompute to match) while also fetching immediately
+      // with the same values here, and pre-marking the params key as
+      // already-fetched — otherwise the debounced reset effect would see
+      // its own state update land a moment later and immediately re-fetch
+      // with the (momentarily stale) un-reset filters, undoing this and
+      // re-triggering a flash/reload.
+      handleFilterChange(browseFilters)
+      lastFetchedCatalogParamsKeyRef.current = catalogParamsKey(browseSearch, browseFilters)
+      fetchCatalogGames({ reset: true, search: browseSearch, filters: browseFilters })
+    } else if (catalogTotal === null) {
+      lastFetchedCatalogParamsKeyRef.current = catalogParamsKey(catalogSearch, catalogQueryFilters)
+      fetchCatalogGames({ reset: true, search: catalogSearch, filters: catalogQueryFilters })
+    }
+  }, [
+    browseAvailable,
+    catalogQueryFilters,
+    catalogSearch,
+    catalogTotal,
+    fetchCatalogGames,
+    handleFilterChange,
+    libraryMode,
+    setAndPersistSidePanelMode,
+    sidebarMode,
+  ])
+
+  const loadWishlistIdentities = useCallback(() => {
+    return window.electronAPI
+      .getWishlistEntryIdentities?.()
+      .then((ids) => {
+        const next = new Set((Array.isArray(ids) ? ids : []).filter(Boolean).map(String))
+        setWishlistIdentityKeys(next)
+        return next
+      })
+      .catch((err) => {
+        console.error('Failed to load wishlist identities:', err)
+        return new Set()
+      })
+  }, [])
+
+  const openWishlist = useCallback(() => {
+    setLibraryMode('wishlist')
+    setSelectedGame(null)
+    setAndPersistSidePanelMode(SIDE_PANEL_MODES.WISHLIST)
+    setShowSearchSidebar(false)
+    Promise.all([fetchWishlistGames(), loadWishlistIdentities()])
+      .catch((err) => console.error('Failed to open wishlist:', err))
+  }, [fetchWishlistGames, loadWishlistIdentities, setAndPersistSidePanelMode])
+
+  const openFavorites = useCallback(() => {
+    setLibraryView('grid')
+    const favoriteFilters = normalizeFilterState({
+      ...defaultFilters,
+      favoritesOnly: true,
+      includeUninstalled: true,
+      installState: 'all',
+    })
+    setLibraryMode('local')
+    setSelectedGame(null)
+    setActiveSavedFilterId('builtin-favorites')
+    // Deliberately does NOT touch the side panel. Favourites is a filter over
+    // the local library, not a distinct view like Wishlist or Browse, so it has
+    // no business rearranging panels the user has set. It previously forced the
+    // games list open via setAndPersistSidePanelMode, which also WROTE that to
+    // settings -- so a user who kept the list hidden had it reopened, and the
+    // change stuck across restarts.
+    handleFilterChange(favoriteFilters)
+  }, [handleFilterChange])
+
+  const handleWishlistChanged = useCallback(async (result = {}, sourceGame = null) => {
+    const identityKey = result.identityKey || getWishlistIdentityKey(sourceGame || result.entry || {})
+    setWishlistIdentityKeys((prev) => {
+      const next = new Set(prev)
+      if (result.isWishlisted === false || result.removed) next.delete(identityKey)
+      else if (identityKey) next.add(identityKey)
+      return next
+    })
+    await fetchWishlistGames()
+    if (libraryMode === 'wishlist' && result.isWishlisted === false) {
+      setSelectedGame((current) => {
+        if (!current) return current
+        return getWishlistIdentityKey(current) === identityKey ? null : current
+      })
+    } else if (sourceGame) {
+      setSelectedGame((current) => {
+        if (!current || getWishlistIdentityKey(current) !== identityKey) return current
+        return { ...current, isWishlisted: result.isWishlisted !== false }
+      })
+    }
+  }, [fetchWishlistGames, libraryMode])
+
+  const toggleSearchSidebar = useCallback(() => {
+    if (selectedGame) return
+    setShowSearchSidebar((prev) => !prev)
+  }, [selectedGame])
+
+  const handleSearchChange = useCallback((text) => {
+    setActiveSavedFilterId('')
+    handleFilterChange({ text })
+  }, [handleFilterChange])
+
+  const resetFilters = useCallback(() => {
+    setActiveSavedFilterId('')
+    pendingLibraryScrollTopRestoreRef.current = 0
+    libraryScrollTopRef.current = 0
+    if (libraryMode === 'catalog') {
+      // "Reset" in Browse mode should mean the whole catalog, not the
+      // local library's installed-only default — otherwise resetting
+      // filters while browsing collapses the view back down to just your
+      // installed titles instead of showing everything.
+      handleFilterChange({ ...defaultFilters, includeUninstalled: true, installState: 'all' })
+    } else {
+      handleResetFilters()
+    }
+    gridRef.current?.recomputeGridSize?.()
+    gridRef.current?.forceUpdate?.()
+  }, [handleResetFilters, handleFilterChange, libraryMode])
+
+  const loadSavedFilters = useCallback(() => {
+    return window.electronAPI
+      .getSavedFilters?.()
+      .then((filters) => {
+        const normalized = (Array.isArray(filters) ? filters : [])
+          .filter((filter) => filter && filter.id && filter.name)
+          .map((filter) => ({
+            ...filter,
+            builtIn: false,
+            filters: normalizeFilterState(filter.filters),
+          }))
+          .sort((a, b) => String(a.name).localeCompare(String(b.name)))
+        setUserSavedFilters(normalized)
+      })
+      .catch((err) => console.error('Failed to load saved filters:', err))
+  }, [])
+
+  const handleSavedFilterSaved = useCallback((filter) => {
+    if (!filter?.id) return
+    const normalized = {
+      ...filter,
+      builtIn: false,
+      filters: normalizeFilterState(filter.filters),
+    }
+    setUserSavedFilters((prev) => {
+      const withoutExisting = prev.filter((item) => item.id !== normalized.id)
+      return [...withoutExisting, normalized].sort((a, b) =>
+        String(a.name).localeCompare(String(b.name)),
+      )
+    })
+    setActiveSavedFilterId(normalized.id)
+  }, [])
+
+  const applySavedFilter = useCallback((filter) => {
+    if (!filter) return
+    const nextFilters = normalizeFilterState(filter.filters)
+    pendingLibraryScrollTopRestoreRef.current = 0
+    libraryScrollTopRef.current = 0
+    setSelectedGame(null)
+    setShowSearchSidebar(false)
+    setActiveSavedFilterId(filter.id || '')
+    if (filter.id === 'builtin-wishlist') {
+      setLibraryMode('catalog')
+    }
+    handleFilterChange(nextFilters)
+  }, [handleFilterChange])
+
+  const deleteSavedFilter = useCallback(async (filter, action = 'request') => {
+    if (!filter?.id || filter.builtIn) return
+    if (action === 'cancel') {
+      setSavedFilterDeleteStateById((prev) => {
+        const next = { ...prev }
+        delete next[filter.id]
+        return next
+      })
+      return
+    }
+    if (action !== 'confirm') {
+      setSavedFilterDeleteStateById((prev) => ({
+        ...prev,
+        [filter.id]: { confirming: true, busy: false, error: '' },
+      }))
+      return
+    }
+
+    setSavedFilterDeleteStateById((prev) => ({
+      ...prev,
+      [filter.id]: { confirming: true, busy: true, error: '' },
+    }))
+    try {
+      const result = await window.electronAPI.deleteSavedFilter?.(filter.id)
+      if (!result?.success) {
+        setSavedFilterDeleteStateById((prev) => ({
+          ...prev,
+          [filter.id]: {
+            confirming: true,
+            busy: false,
+            error: result?.error || 'Failed to delete filter.',
+          },
+        }))
+        console.error('Failed to delete saved filter:', result?.error)
+        return
+      }
+      setUserSavedFilters((prev) => prev.filter((item) => item.id !== filter.id))
+      setSavedFilterDeleteStateById((prev) => {
+        const next = { ...prev }
+        delete next[filter.id]
+        return next
+      })
+      if (activeSavedFilterId === filter.id) setActiveSavedFilterId('')
+    } catch (err) {
+      setSavedFilterDeleteStateById((prev) => ({
+        ...prev,
+        [filter.id]: {
+          confirming: true,
+          busy: false,
+          error: err.message || 'Failed to delete filter.',
+        },
+      }))
+      console.error('Failed to delete saved filter:', err)
+    }
+  }, [activeSavedFilterId])
+
+
+  // ── DB update check ────────────────────────────────────────────────────────
+  const clearDbUpdateStatusSoon = useCallback(() => {
+    setTimeout(() => setDbUpdateStatus({ text: '', progress: 0, total: 0 }), 2000)
+  }, [])
+
+  const runDbUpdateCheck = useCallback(async () => {
+    if (dbUpdateRunningRef.current) return
+    dbUpdateRunningRef.current = true
+    setDbUpdateStatus({ text: 'Checking database updates...', progress: 0, total: 0 })
+    try {
+      const result = await window.electronAPI.checkDbUpdates()
+      if (!result.success) {
+        setDbUpdateStatus({ text: `Error: ${result.error}`, progress: 0, total: 100 })
+      } else if (result.total === 0) {
+        setDbUpdateStatus({ text: result.message, progress: 0, total: 0 })
+      } else {
+        setDbUpdateStatus({
+          text: result.message || 'Database updates complete',
+          progress: result.processed || result.total,
+          total: result.total,
+        })
+      }
+      clearDbUpdateStatusSoon()
+    } catch (error) {
+      console.error('Failed to check database updates:', error)
+      setDbUpdateStatus({ text: `Error: ${error.message}`, progress: 0, total: 100 })
+      clearDbUpdateStatusSoon()
+    } finally {
+      dbUpdateRunningRef.current = false
+    }
+  }, [clearDbUpdateStatusSoon])
+
+  // The nav "Updates" button opens a CHOOSER now. Refreshing library metadata is
+  // still what one of its entries does — and still runs the online DB catalog
+  // sync plus a library-wide media refresh, with images downloaded vs streamed
+  // per Settings > Metadata — but it is no longer the only thing the button can
+  // lead to. See LibraryUpdateModal.jsx.
+  const openLibraryRefreshModal = useCallback(() => {
+    setLibraryUpdateModalOpen(true)
+  }, [])
+
+  // Games the library says have a newer version. Read straight off the loaded
+  // local library rather than re-queried: isUpdateAvailable is computed in
+  // db/versions.js and projected onto every row, so a second query would only
+  // be a chance for the count in the chooser and the length of the run to
+  // disagree.
+  const updatableGames = useMemo(
+    () => games.filter((game) => game?.isUpdateAvailable === true),
+    [games],
+  )
+
+  const handleLibraryUpdateChoice = useCallback((choice) => {
+    setLibraryUpdateModalOpen(false)
+    if (choice === 'metadata') {
+      setRefreshLibraryProgress(null)
+      setRefreshLibraryModalOpen(true)
+      return
+    }
+    if (choice === 'client') {
+      // Straight into the existing footer-toast flow rather than a new dialog.
+      // handleAppUpdateAction already owns every branch of this — checking,
+      // downloading, "package not ready", the install-and-restart step — and a
+      // second entry point would be a second copy of that state machine.
+      handleAppUpdateAction()
+      return
+    }
+    if (choice === 'games') setUpdateAllOpen(true)
+  }, [handleAppUpdateAction])
+
+  const confirmLibraryRefresh = useCallback(async (mode) => {
+    if (refreshLibraryBusy) return
+    // Close the mode-picker modal immediately — the actual work streams into the
+    // bottom import progress bar so the user keeps full use of the app.
+    setRefreshLibraryModalOpen(false)
+    setRefreshLibraryBusy(true)
+    setImportProgress({ text: 'Checking database updates…', progress: 0, total: 0 })
+
+    // Pump refresh-media-progress into the bottom bar.
+    const onProgress = (data) => {
+      setImportProgress({
+        text: data?.text || 'Refreshing media…',
+        progress: data?.processed || 0,
+        total: data?.total || 0,
+      })
+    }
+    window.electronAPI.onRefreshMediaProgress?.(onProgress)
+
+    ;(async () => {
+      try {
+        try {
+          await window.electronAPI.checkDbUpdates()
+        } catch (e) {
+          console.error('DB update during library refresh failed:', e)
+        }
+        setImportProgress({ text: 'Refreshing media…', progress: 0, total: 0 })
+        const result = await window.electronAPI.refreshMediaLibrary({ mode })
+        if (result?.success === false) throw new Error(result.error || 'Media refresh failed')
+        setImportProgress({
+          text: `Media refresh complete (${result?.processed || 0}/${result?.total || 0}).`,
+          progress: result?.processed || 0,
+          total: result?.total || 0,
+        })
+        if (typeof fetchGames === 'function') fetchGames()
+        setTimeout(() => setImportProgress({ text: '', progress: 0, total: 0 }), 2500)
+      } catch (error) {
+        console.error('Library refresh failed:', error)
+        setImportProgress({ text: `Refresh error: ${error.message}`, progress: 0, total: 0 })
+        setTimeout(() => setImportProgress({ text: '', progress: 0, total: 0 }), 4000)
+      } finally {
+        window.electronAPI.removeRefreshMediaProgressListener?.()
+        setRefreshLibraryBusy(false)
+      }
+    })()
+  }, [refreshLibraryBusy, fetchGames])
+
+  // ── Actions ────────────────────────────────────────────────────────────────
+
+  // Opens the About modal (app description, community/help links,
+  // issue-reporting info, and a way to replay the welcome tour).
+  const openAbout = () => setAboutOpen(true)
+
+  // Passively check for remote-removed mappings on mount so we can surface a
+  // banner prompting the user to run a full audit in Settings → Database.
+  useEffect(() => {
+    let cancelled = false
+    window.electronAPI.getInvalidMappingCount?.()
+      .then((res) => { if (!cancelled && res?.success !== false) setInvalidMappingCount(res?.count || 0) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+
+  // Passively scan for mergeable duplicate games (shared atlas_id) so we can
+  // surface a banner prompting the user to merge them in Settings → Database.
+  // Re-runs when the library changes (e.g. after a merge or an import).
+  useEffect(() => {
+    let cancelled = false
+    const scan = () => {
+      window.electronAPI.auditSeasonMerges?.()
+        .then((res) => { if (!cancelled && res?.success !== false) setMergeableCount(res?.total || 0) })
+        .catch(() => {})
+    }
+    scan()
+    const onChanged = () => scan()
+    window.addEventListener('atlas:library-changed', onChanged)
+    return () => { cancelled = true; window.removeEventListener('atlas:library-changed', onChanged) }
+  }, [])
+
+  // Replay the welcome tour from the About modal.
+  const replayWelcomeTour = () => {
+    firstRunTourRef.current = false
+    setAboutOpen(false)
+    setShowWelcomeTour(true)
+  }
+
+  // Called when the main welcome tour closes. On first run, chain into the
+  // settings window and auto-run its tour (tasks: open settings tour after the
+  // main tour, and still do so if the user skipped/closed the welcome).
+  const handleWelcomeTourClose = () => {
+    setShowWelcomeTour(false)
+    if (firstRunTourRef.current) {
+      firstRunTourRef.current = false
+      try { window.electronAPI.openSettings?.({ tour: true }) } catch { /* ignore */ }
+    }
+  }
+
+  // First-run sequence step 1 -> 2: user pressed "Get Started" on the
+  // welcome page. Persist that the welcome page has been seen (its own flag,
+  // separate from the age prompt), then either show the age confirmation
+  // (which will launch the tour once answered) or, if age is already
+  // configured, go straight to the tour.
+  const handleWelcomeDone = () => {
+    try {
+      window.localStorage?.setItem(WELCOME_SEEN_KEY, 'true')
+    } catch {
+      // best-effort persistence only
+    }
+    setShowWelcome(false)
+    if (ageNeedsPromptRef.current) {
+      startTourAfterAgeRef.current = true
+      setNsfwPromptOpen(true)
+    } else {
+      firstRunTourRef.current = true
+      setShowWelcomeTour(true)
+    }
+  }
+
+  const cancelImport = async () => {
+    try {
+      setImportProgress((prev) => ({
+        ...prev,
+        text: 'Cancel requested. Cleaning up current import...',
+        canCancel: false,
+        canceling: true,
+      }))
+      await window.electronAPI.cancelImport()
+    } catch (error) {
+      console.error('Failed to cancel import:', error)
+    }
+  }
+
+  const isTextInputTarget = (target) => {
+    if (!target) return false
+    const tagName = target.tagName?.toLowerCase()
+    return tagName === 'input' || tagName === 'textarea' || tagName === 'select' || target.isContentEditable
+  }
+
+  // ── IPC listeners + init ───────────────────────────────────────────────────
+  useEffect(() => {
+    Promise.all([
+      window.electronAPI.getNsfwStatus?.().catch(() => null),
+      window.electronAPI.getConfig(),
+    ])
+      .then(([nsfwStatus, config]) => {
+        const enabled = nsfwStatus?.enabled === true
+        setNsfwEnabled(enabled)
+        // No need to touch activeFilters: an empty searchFields means "inherit
+        // the configured default", which resolveSearchFieldIds reads from here.
+        applyDefaultSearchFields(config?.Search?.defaultFields)
+        // Whether the age/adult-content prompt still needs an answer
+        // (config has never recorded one). We don't open it immediately
+        // anymore — the first-run welcome page comes first (tracked by its
+        // own separate flag). See handleWelcomeDone / handleNsfwChoice for
+        // the welcome -> age -> tour sequence.
+        const ageNeedsPrompt = !!(nsfwStatus && nsfwStatus.configured === false)
+        ageNeedsPromptRef.current = ageNeedsPrompt
+
+        let welcomeSeen = false
+        try {
+          welcomeSeen = window.localStorage?.getItem(WELCOME_SEEN_KEY) === 'true'
+        } catch {
+          welcomeSeen = false
+        }
+        if (!welcomeSeen) {
+          // Brand-new user (or one who has never seen the welcome page):
+          // show the welcome page first; the age prompt (if needed) and the
+          // tour follow from "Get Started".
+          setShowWelcome(true)
+        } else if (ageNeedsPrompt) {
+          // Returning user who somehow hasn't answered the age prompt yet:
+          // just show that prompt on its own (no welcome, no tour).
+          setNsfwPromptOpen(true)
+        }
+
+        // Restore which collection groups were expanded in the tree.
+        const savedExpanded = String(config.Interface?.expandedCollections || '')
+          .split(',')
+          .map((value) => value.trim())
+          .filter(Boolean)
+        if (savedExpanded.length > 0) setExpandedCollectionIds(new Set(savedExpanded))
+
+        // Extract appUpdateBranch from Interface settings for version link logic
+        const updateBranch = config.Interface?.appUpdateBranch === 'nightly' ? 'nightly' : 'stable'
+        setAppUpdateBranch(updateBranch)
+
+        const browseOk = BROWSE_MODE_ENABLED && enabled
+        let nextMode = normalizeSidePanelMode(
+          config.Interface?.sidePanelMode,
+          config.Interface?.showGameList ?? true,
+          browseOk,
+        )
+        // Atlas should always open to the local library on launch. The
+        // persisted sidePanelMode is still used to restore the sidebar style
+        // (game list vs. saved filters) the user last had, but a persisted
+        // Browse (catalog) or Wishlist mode must NOT be used as the startup
+        // destination — those are only entered via explicit navigation
+        // during the session.
+        if (nextMode === SIDE_PANEL_MODES.CATALOG || nextMode === SIDE_PANEL_MODES.WISHLIST) {
+          nextMode = SIDE_PANEL_MODES.GAMES
+        }
+        setSidebarMode(nextMode)
+        setLibraryMode('local')
+      })
+      .catch(() => setSidebarMode(SIDE_PANEL_MODES.GAMES))
+
+    fetchGames(true, { skipPathValidation: true }).then(() => {
+      window.electronAPI.getConfig()
+        .then((config) => {
+          const shouldValidate = config?.Library?.validatePathsOnStartup === true ||
+            config?.Library?.validatePathsOnStartup === 'true'
+          if (!shouldValidate) return
+          const runValidation = () => window.electronAPI.validateLibraryPaths?.()
+          if (window.requestIdleCallback) {
+            window.requestIdleCallback(runValidation, { timeout: 5000 })
+          } else {
+            setTimeout(runValidation, 1500)
+          }
+        })
+        .catch((error) => console.error('Failed to read startup validation setting:', error))
+    })
+    loadWishlistIdentities()
+    loadSavedFilters()
+
+    loadVersion()
+    // Defer the database update check so the initial UI and library grid render
+    // and load first. Processing a full snapshot holds the database in a long
+    // write transaction, which starves the initial get-games read on the shared
+    // connection and looks like the UI hanging. Running it once the renderer is
+    // idle lets the library show before the (background) update begins.
+    if (typeof window.requestIdleCallback === 'function') {
+      window.requestIdleCallback(() => runDbUpdateCheck(), { timeout: 4000 })
+    } else {
+      setTimeout(() => runDbUpdateCheck(), 2000)
+    }
+
+    // IPC handlers
+    const handleDbUpdateProgress = (progress) => {
+      setDbUpdateStatus(sanitizeProgressState(progress))
+      if (progress.progress >= progress.total && progress.total > 0) {
+        setTimeout(() => setDbUpdateStatus({ text: '', progress: 0, total: 0 }), 2000)
+      }
+    }
+
+    const handleImportProgress = (progress) => {
+      const nextProgress = sanitizeProgressState(progress)
+      setImportProgress(nextProgress)
+      const isComplete =
+        nextProgress.done === true ||
+        nextProgress.complete === true ||
+        nextProgress.canceled === true ||
+        nextProgress.phase === 'done' ||
+        nextProgress.phase === 'failed' ||
+        nextProgress.phase === 'canceled' ||
+        (
+          nextProgress.progress >= nextProgress.total &&
+          nextProgress.total > 0 &&
+          nextProgress.canCancel === false
+        )
+      if (isComplete) {
+        setTimeout(() => setImportProgress({ text: '', progress: 0, total: 0 }), 2000)
+      }
+    }
+
+    const handleGameImported = (event, recordId) => {
+      console.log(`Game imported: recordId ${recordId}`)
+      window.electronAPI.getGame(recordId)
+        .then((game) => { if (game) replaceGameInState(game) })
+        .catch((error) => console.error(`Failed to get game for recordId ${recordId}:`, error))
+    }
+
+    const handleGameUpdated = (event, payload) => {
+      if (payload && typeof payload === 'object') {
+        replaceGameInState(payload)
+        return
+      }
+      refreshGame(payload)
+    }
+
+    const handleGameDeleted = (recordId) => {
+      removeGameFromState(recordId)
+      setSelectedGame((current) => (current?.record_id === recordId ? null : current))
+      if (gridRef.current) {
+        gridRef.current.recomputeGridSize()
+        gridRef.current.forceUpdate()
+      }
+    }
+
+    // The post-boot stale-exec repair changed exec_path on one or more versions,
+    // which flips their installed/missing state. Re-read rather than leave the
+    // grid showing badges that are now wrong.
+    const handleLibraryExecPathsRepaired = (summary) => {
+      console.log(`Stale executable repair updated ${summary?.repaired || 0} version(s); refreshing library`)
+      fetchGames(false, { skipPathValidation: true })
+    }
+
+    const handleLibraryValidationProgress = (progress) => {
+      if (progress?.error) { console.error('Library validation error:', progress.error); return }
+      if (progress?.total) {
+        setDbUpdateStatus({
+          text: 'Validating installed paths...',
+          progress: progress.processed,
+          total: progress.total,
+        })
+        if (progress.processed >= progress.total) {
+          setTimeout(() => setDbUpdateStatus({ text: '', progress: 0, total: 0 }), 1200)
+        }
+      }
+    }
+
+  const handleImportComplete = () => {
+    fetchGames()
+      if (browseAvailableRef.current) {
+        fetchCatalogGames({ search: catalogSearchRef.current, filters: catalogQueryFiltersRef.current })
+      }
+      fetchWishlistGames()
+      setTimeout(() => setImportProgress({ text: '', progress: 0, total: 0 }), 2000)
+    }
+
+    // Metadata settings (e.g. source order for banner/hero art) are applied
+    // server-side on every get-games/get-game call, but the renderer caches
+    // its game list in state — refetch so the change is visible immediately
+    // instead of requiring a restart. This effect only runs once on mount,
+    // so it can't safely read the latest libraryMode from a stale closure;
+    // refreshing all three lists is cheap and keeps each one correct
+    // whenever the user does switch to it.
+    const handleSearchDefaultsChanged = (_event, payload) => {
+      applyDefaultSearchFields(payload?.defaultFields)
+    }
+
+    const handleMetadataChanged = () => {
+      fetchGames()
+      if (browseAvailableRef.current) {
+        fetchCatalogGames({ search: catalogSearchRef.current, filters: catalogQueryFiltersRef.current })
+      }
+      fetchWishlistGames()
+    }
+
+    // The browser extension can write wishlist entries while the library is
+    // open. Refresh the wishlist, the identity keys that annotate catalog rows,
+    // and the main library, then re-sync the open detail panel if it is showing
+    // the entry that just changed.
+    const handleWishlistUpdated = async () => {
+      await Promise.all([
+        fetchWishlistGames(),
+        loadWishlistIdentities(),
+        fetchGames(),
+      ])
+      if (browseAvailableRef.current) {
+        fetchCatalogGames({ search: catalogSearchRef.current, filters: catalogQueryFiltersRef.current })
+      }
+      setSelectedGame((current) => {
+        if (!current) return current
+        window.electronAPI.isWishlistEntry?.(current).then((isWish) => {
+          if (typeof isWish === 'boolean') {
+            setSelectedGame((prev) => {
+              if (!prev || getWishlistIdentityKey(prev) !== getWishlistIdentityKey(current)) return prev
+              return {
+                ...prev,
+                isWishlisted: isWish,
+                isWishlistEntry: isWish || prev.isWishlistEntry,
+              }
+            })
+          }
+        })
+        return current
+      })
+    }
+
+    window.electronAPI.onWindowStateChanged(handleWindowStateChanged)
+    const removeWishlistUpdatedListener =
+      window.electronAPI.onWishlistUpdated?.(handleWishlistUpdated)
+    window.electronAPI.onDbUpdateProgress(handleDbUpdateProgress)
+    window.electronAPI.onImportProgress(handleImportProgress)
+    window.electronAPI.onGameImported(handleGameImported)
+    window.electronAPI.onGameUpdated(handleGameUpdated)
+    window.electronAPI.onGameDeleted(handleGameDeleted)
+    window.electronAPI.onLibraryValidationProgress?.(handleLibraryValidationProgress)
+    const removeExecRepairListener =
+      window.electronAPI.onLibraryExecPathsRepaired?.(handleLibraryExecPathsRepaired)
+    window.electronAPI.onImportComplete(handleImportComplete)
+    // The import wizard closes as soon as an import starts, so failures are
+    // reported here rather than in a window that's already gone.
+    const removeImportFailedListener = window.electronAPI.onImportFailed?.((payload) => {
+      const count = payload?.count || 0
+      if (count <= 0) return
+      const errors = Array.isArray(payload?.errors) ? payload.errors : []
+      toast.error(`${count} import${count === 1 ? '' : 's'} failed`, {
+        message: errors.join('\n') || 'Unknown import failure',
+        duration: 12000,
+      })
+    })
+    window.electronAPI.onUpdateStatus(handleUpdateStatus)
+    window.electronAPI.onRefreshMediaProgress?.((data) => {
+      setRefreshLibraryProgress({
+        text: data?.text || 'Refreshing…',
+        processed: data?.processed || 0,
+        total: data?.total || 0,
+      })
+    })
+    const removeMetadataListener = window.electronAPI.onMetadataChanged?.(handleMetadataChanged)
+    const removeNsfwListener = window.electronAPI.onNsfwChanged?.((data) => {
+      // Keeps this window's Browse availability in sync when the NSFW
+      // setting is changed from elsewhere — e.g. the Settings window's
+      // toggle, or this same prompt answered in another open window.
+      setNsfwEnabled(data?.enabled === true)
+    })
+    window.electronAPI.getAppUpdateState?.()
+      .then((status) => { if (status?.status && status.status !== 'idle') handleUpdateStatus(status) })
+      .catch((error) => console.error('Failed to load app update state:', error))
+
+    // "+ New Collection" / Rename / Delete chosen in a native context menu.
+    // The main process can't prompt, so it asks this window to drive the UI.
+    const removeCollectionCreateListener = window.electronAPI.onCollectionCreateRequested?.((payload) => {
+      setCollectionModalError('')
+      setCollectionModal({ mode: 'create', recordId: payload?.recordId || null })
+    })
+    const removeCollectionRenameListener = window.electronAPI.onCollectionRenameRequested?.((payload) => {
+      setCollectionModalError('')
+      setCollectionModal({
+        mode: 'rename',
+        collectionId: payload?.collectionId,
+        name: payload?.name || '',
+        color: payload?.color || null,
+      })
+    })
+    const removeRateTitleListener = window.electronAPI.onRateTitleRequested?.((payload) => {
+      // Records the id ONLY. This listener lives in a []-dependency effect, so
+      // anything it closes over is captured from the first render — `games` was
+      // still empty, so looking the title up here always failed and the
+      // navigation never happened. The effect below does the lookup with real
+      // dependencies instead.
+      if (payload?.recordId) setPendingRatingRecordId(payload.recordId)
+    })
+    const removeCollectionBulkTagListener = window.electronAPI.onCollectionBulkTagRequested?.((payload) => {
+      setBulkTagTarget({ id: payload?.collectionId, name: payload?.name || '' })
+    })
+    const removeCollectionDeleteListener = window.electronAPI.onCollectionDeleteRequested?.((payload) => {
+      setPendingCollectionDelete({
+        id: payload?.collectionId,
+        name: payload?.name || 'this collection',
+      })
+    })
+
+    window.addEventListener('resize', debounceResize)
+    debounceResize()
+
+    return () => {
+      window.electronAPI.removeUpdateStatusListener?.()
+      if (typeof removeMetadataListener === 'function') removeMetadataListener()
+      if (typeof removeNsfwListener === 'function') removeNsfwListener()
+      if (typeof removeExecRepairListener === 'function') removeExecRepairListener()
+      if (typeof removeImportFailedListener === 'function') removeImportFailedListener()
+      if (typeof removeCollectionCreateListener === 'function') removeCollectionCreateListener()
+      if (typeof removeCollectionRenameListener === 'function') removeCollectionRenameListener()
+      if (typeof removeCollectionDeleteListener === 'function') removeCollectionDeleteListener()
+      if (typeof removeCollectionBulkTagListener === 'function') removeCollectionBulkTagListener()
+      if (typeof removeRateTitleListener === 'function') removeRateTitleListener()
+      if (typeof removeWishlistUpdatedListener === 'function') removeWishlistUpdatedListener()
+      window.removeEventListener('resize', debounceResize)
+      ;[
+        'window-state-changed', 'db-update-progress', 'import-progress',
+        'game-imported', 'game-updated', 'library-validation-progress',
+        'import-complete', 'game-deleted',
+      ].forEach((channel) => window.electronAPI.removeAllListeners(channel))
+    }
+  }, [])
+
+  useEffect(() => {
+    requestAnimationFrame(() => debounceResize())
+  }, [showLibrarySidebar, showSearchSidebar, filterSidebarMode, filterSidebarSide, libraryMode])
+
+  // In 'inline' mode the filter sidebar is docked (shares space with the
+  // grid) rather than a toggle-on-demand overlay, so it should be visible
+  // whenever inline is the active mode — selecting inline is itself the
+  // request to show it. Runs when the mode becomes inline (or a game is
+  // deselected back to the library while inline), not continuously, so the
+  // Close button in the panel still works: closing sets showSearchSidebar
+  // false and this won't re-fire until the mode changes again. Overlay
+  // mode keeps its original toggle-driven behavior.
+  useEffect(() => {
+    if (filterSidebarMode === 'inline' && !selectedGame) {
+      setShowSearchSidebar(true)
+    }
+  }, [filterSidebarMode, selectedGame])
+
+  const catalogResetDebounceRef = useRef(null)
+  useEffect(() => {
+    if (libraryMode !== 'catalog' || !browseAvailable) return
+    const paramsKey = catalogParamsKey(catalogSearch, catalogQueryFilters)
+    if (lastFetchedCatalogParamsKeyRef.current === paramsKey) {
+      // Nothing about the search/filters actually changed since the last
+      // fetch we dispatched — this effect only re-ran because some other
+      // dependency changed (most commonly: entering Browse mode itself, or
+      // catalogTotal updating once that fetch resolved). Re-fetching here
+      // would wipe and reload data that's already correct, which is exactly
+      // the "banners flash, spinner, banners reload" sequence this fixes.
+      return
+    }
+    if (catalogResetDebounceRef.current) clearTimeout(catalogResetDebounceRef.current)
+    catalogResetDebounceRef.current = setTimeout(() => {
+      catalogResetDebounceRef.current = null
+      lastFetchedCatalogParamsKeyRef.current = paramsKey
+      fetchCatalogGames({ reset: true, search: catalogSearch, filters: catalogQueryFilters })
+    }, 300)
+    return () => {
+      if (catalogResetDebounceRef.current) {
+        clearTimeout(catalogResetDebounceRef.current)
+        catalogResetDebounceRef.current = null
+      }
+    }
+  }, [browseAvailable, catalogQueryFilters, catalogSearch, catalogTotal, fetchCatalogGames, libraryMode])
+
+  // When the catalog index finishes building, anything already on screen in
+  // Browse came from the slower fallback scan (or from nothing at all, if the
+  // build state was showing). Refetch once on the false -> true transition so the
+  // user ends up with index-ordered results without having to touch a filter.
+  const catalogIndexWasReadyRef = useRef(true)
+  useEffect(() => {
+    const ready = catalogIndexState?.ready !== false
+    const becameReady = ready && !catalogIndexWasReadyRef.current
+    catalogIndexWasReadyRef.current = ready
+    if (!becameReady) return
+    if (libraryMode !== 'catalog' || !browseAvailable) return
+    lastFetchedCatalogParamsKeyRef.current = catalogParamsKey(catalogSearch, catalogQueryFilters)
+    fetchCatalogGames({ reset: true, search: catalogSearch, filters: catalogQueryFilters })
+  }, [
+    browseAvailable,
+    catalogIndexState?.ready,
+    catalogQueryFilters,
+    catalogSearch,
+    fetchCatalogGames,
+    libraryMode,
+  ])
+
+  useEffect(() => {
+    if (!showSavedFilters || includeUninstalledRef.current) return
+    includeUninstalledRef.current = true
+    fetchGames(true)
+  }, [showSavedFilters, fetchGames, includeUninstalledRef])
+
+  useEffect(() => {
+    if (selectedGame) return
+    restoreLibraryScrollIfNeeded()
+  }, [
+    selectedGame,
+    filteredGames.length,
+    bannerSize.bannerHeight,
+    showLibrarySidebar,
+    showSearchSidebar,
+    filterSidebarMode,
+    filterSidebarSide,
+    libraryMode,
+    restoreLibraryScrollIfNeeded,
+  ])
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (!selectedGame || event.key !== 'Backspace' || isTextInputTarget(event.target)) return
+      event.preventDefault()
+      goBackToLibrary()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [selectedGame, goBackToLibrary])
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  return (
+    <div className="flex flex-col h-screen font-sans text-[13px] overflow-hidden">
+      {/* This window uses native OS chrome (see electron/main.js —
+          titleBarStyle: 'hidden'): the OS draws the frame, rounded
+          corners, shadow and resize border, and provides the native
+          minimize/maximize/close caption buttons. So there's no custom
+          window border overlay or CSS corner-rounding here anymore, and
+          the header's own min/max/close buttons have been removed in
+          favor of the native ones. The header still acts as the drag
+          region. */}
+      {/* Header — position:fixed so the TopNav importer dropdown (absolutely
+          positioned, extends below this 70px bar) isn't clipped. */}
+      <div className="flex h-[70px] items-center z-50 fixed w-full top-0 select-none -webkit-app-region-drag">
+        <div
+          className="w-[60px] bg-accent flex items-center justify-center h-[70px] z-50 cursor-pointer -webkit-app-region-no-drag shadow-[0_8px_8px_-8px_rgba(0,0,0,0.5)]"
+          onClick={goHome}
+          title="Back to Library"
+        >
+          {logoVariant === 'colored' ? (
+            <img
+              src={coloredAtlasLogoUrl}
+              alt="Atlas"
+              className="w-[50px] h-[50px] object-contain pointer-events-none select-none"
+              draggable={false}
+              style={{ shapeRendering: 'geometricPrecision' }}
+            />
+          ) : (
+            <svg
+              className="w-[50px] h-[50px] text-atlasLogo"
+              viewBox="0 0 24 24"
+              style={{ shapeRendering: 'geometricPrecision' }}
+              fill="currentColor"
+              dangerouslySetInnerHTML={{ __html: atlasLogo.path }}
+            />
+          )}
+        </div>
+        <div className="flex-1 h-[70px] bg-primary relative -webkit-app-region-drag shadow-[0_8px_8px_-8px_rgba(0,0,0,0.5)]">
+          {/* Accent bar: the notched strip tucked behind the logo block.
+              Shown in both layouts as long as the active theme's
+              nav.accentBarEnabled hasn't been turned off (see
+              ThemeProvider.jsx / Appearance.jsx) — previously this was
+              hardcoded to sidebar-only. */}
+          {accentBarEnabled && (
+            <>
+              <div className="absolute top-0 left-[50px] right-[110px] h-[10px] bg-accentBar"></div>
+              <div className="absolute top-0 left-[40px] w-[10px] h-[10px] bg-accentBar" style={{ clipPath: 'polygon(0% 0%, 100% 0%, 100% 100%)' }}></div>
+              <div className="absolute top-0 right-[100px] w-[10px] h-[10px] bg-accentBar" style={{ clipPath: 'polygon(0% 0%, 100% 0%, 0% 100%)' }}></div>
+            </>
+          )}
+          <div className="w-full flex h-[70px] items-center">
+            {!isTopNav && (
+              <div className="flex items-center ml-5">
+                <div
+                  className="text-shadow-fx text-glow-fx page-titles text-accent font-semibold cursor-pointer -webkit-app-region-no-drag"
+                  onClick={goHome}
+                  title="Back to Library"
+                >
+                  {viewTitle}
+                </div>
+              </div>
+            )}
+            {isTopNav ? (
+              <>
+                {/* mt-[14px] nudges this whole row down from dead-center
+                    (the parent row is vertically centered across the full
+                    70px header) so it visually clears the min/max/close
+                    row, which sits near the very top of the header. Both
+                    the left and right TopNav groups share this same
+                    mt-[14px]/flex row so they stay vertically aligned with
+                    each other — see the absolutely positioned
+                    window-controls block below for min/max/close. */}
+                <div className="ml-5 mt-[14px]">
+                  <TopNav
+                    group="left"
+                    onToggleGameList={toggleGameList}
+                    onCheckDbUpdates={openLibraryRefreshModal}
+                    onGoHome={goHome}
+                    onBrowseCatalog={browseCatalog}
+                    onOpenWishlist={openFavorites}
+                    onToggleSearchSidebar={toggleSearchSidebar}
+                    onOpenAbout={openAbout}
+                    onOpenCollections={openCollections}
+                    showGameList={showGameList}
+                    libraryMode={libraryMode}
+                    favoritesActive={favoritesActive}
+                    collectionsActive={collectionsActive}
+                    browseAvailable={browseAvailable}
+                  />
+                </div>
+                <div className="flex-1" />
+                {/* Shifted in from the right edge so it doesn't sit flush
+                    against the corner. Version text now lives in this same
+                    flex row, right after the icon group, so the icons are
+                    guaranteed to sit to its left with no overlap (rather
+                    than two independently-positioned absolute blocks that
+                    could collide). forceIconsOnly keeps this group
+                    icon-only regardless of the active theme's
+                    navDisplayMode, per the current request — Filters/Help
+                    etc. on the left can still show text if the theme says
+                    so. */}
+                {/* mr clears the custom caption buttons (top-right, ~92px)
+                    plus a little breathing room. */}
+                <div className="mt-[14px] mr-[100px] flex items-center gap-3">
+                  <TopNav
+                    group="right"
+                    forceIconsOnly
+                    onToggleGameList={toggleGameList}
+                    onCheckDbUpdates={openLibraryRefreshModal}
+                    onGoHome={goHome}
+                    onBrowseCatalog={browseCatalog}
+                    onOpenWishlist={openFavorites}
+                    onToggleSearchSidebar={toggleSearchSidebar}
+                    onOpenAbout={openAbout}
+                    onOpenCollections={openCollections}
+                    showGameList={showGameList}
+                    libraryMode={libraryMode}
+                    favoritesActive={favoritesActive}
+                    collectionsActive={collectionsActive}
+                    browseAvailable={browseAvailable}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const url = buildVersionUrl(version)
+                      window.electronAPI?.openExternalUrl?.(url)
+                    }}
+                    title={`Version: ${version} - Click to view release`}
+                    className="text-text text-xs whitespace-nowrap hover:text-accent hover:underline transition-colors cursor-pointer bg-transparent border-none p-0"
+                  >
+                    Version: {version} <span style={{ color: 'Goldenrod' }}>β</span>
+                  </button>
+                </div>
+              </>
+            ) : (
+              // Sidebar layout: the header carries the search box, so the
+              // Collections button sits directly to its right. In topnav
+              // layout there is no search box here and Collections is a nav
+              // button instead (see TopNav's LEFT_ORDER).
+              <div className="flex justify-center w-full">
+                <SearchBox value={activeFilters.text} onSearchChange={handleSearchChange} onToggleSidebar={toggleSearchSidebar} />
+              </div>
+            )}
+          </div>
+          {/* Custom caption buttons (minimize/maximize/close). The window
+              uses titleBarStyle: 'hidden' with NO native buttons (see
+              electron/main.js); these match the theme and header height.
+              -webkit-app-region-no-drag so they're clickable within the
+              otherwise-draggable header. */}
+          <div className="flex absolute top-1 right-2 h-[28px] -webkit-app-region-no-drag z-50">
+            <button onClick={() => window.electronAPI.minimizeWindow()} className="w-7 h-7 flex items-center justify-center bg-transparent hover:bg-tertiary transition-colors duration-200">
+              <i className="fas fa-minus text-text fa-sm"></i>
+            </button>
+            <button onClick={() => window.electronAPI.maximizeWindow()} className="w-7 h-7 flex items-center justify-center bg-transparent hover:bg-tertiary transition-colors duration-200">
+              <i className={isMaximized ? 'fas fa-window-restore text-text fa-sm' : 'fas fa-window-maximize text-text fa-sm'}></i>
+            </button>
+            <button onClick={() => window.electronAPI.closeWindow()} className="w-7 h-7 flex items-center justify-center bg-transparent hover:bg-danger transition-colors duration-200">
+              <i className="fas fa-times text-text fa-sm"></i>
+            </button>
+          </div>
+          {/* Sidebar-mode version readout — topnav mode's version text now
+              lives inline next to the right TopNav group above instead, so
+              it isn't duplicated here. The About button is pinned here too
+              so that in BOTH layouts About lives in the header's top-right
+              corner (topnav mode renders it inside the right TopNav group
+              above); this keeps it in a single, predictable place whether
+              the nav is a top bar or the left rail. data-tour="About" is
+              kept so the welcome tour can still spotlight it. */}
+          {!isTopNav && (
+            <div className="absolute mt-10 top-0 right-2 flex items-center h-[10px] -webkit-app-region-no-drag">
+              <button
+                type="button"
+                onClick={openAbout}
+                title="About"
+                aria-label="About"
+                data-tour="About"
+                className="group btn-shadow btn-glow w-7 h-7 mr-2 flex items-center justify-center rounded-buttonTheme text-text hover:bg-tertiary transition-colors"
+              >
+                <svg className="w-[18px] h-[18px] nav-icon-fx" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12 2C6.477 2 2 6.477 2 12C2 17.523 6.477 22 12 22C17.523 22 22 17.523 22 12C22 6.477 17.523 2 12 2Z M 12 4C16.418 4 20 7.582 20 12C20 16.418 16.418 20 12 20C7.582 20 4 16.418 4 12C4 7.582 7.582 4 12 4Z" />
+                  <path d="M12 6.5C11.310 6.5 10.75 7.060 10.75 7.75C10.75 8.440 11.310 9 12 9C12.690 9 13.25 8.440 13.25 7.75C13.25 7.060 12.690 6.5 12 6.5Z" />
+                  <path d="M11 10.75C11 10.336 11.336 10 11.75 10L12.25 10C12.664 10 13 10.336 13 10.75L13 16.25C13 16.664 12.664 17 12.25 17L11.75 17C11.336 17 11 16.664 11 16.25L11 10.75Z" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const url = buildVersionUrl(version)
+                  window.electronAPI?.openExternalUrl?.(url)
+                }}
+                title={`Version: ${version} - Click to view release`}
+                className="text-text text-xs mr-4 hover:text-accent hover:underline transition-colors cursor-pointer"
+              >
+                Version: {version} <span style={{ color: 'Goldenrod' }}>β</span>
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex flex-1 bg-library fixed w-full top-[70px] bottom-[40px]">
+        {!isTopNav && (
+          <Sidebar
+            onToggleGameList={toggleGameList}
+            onCheckDbUpdates={openLibraryRefreshModal}
+            onGoHome={goHome}
+            onBrowseCatalog={browseCatalog}
+            onOpenWishlist={openFavorites}
+            onToggleSearchSidebar={toggleSearchSidebar}
+            onOpenAbout={openAbout}
+            onOpenCollections={openCollections}
+            collectionsActive={collectionsActive}
+            showGameList={showGameList}
+            libraryMode={libraryMode}
+            favoritesActive={favoritesActive}
+            browseAvailable={browseAvailable}
+          />
+        )}
+
+        {showGameList && (
+          <div
+            className={`w-[200px] bg-secondary fixed top-[70px] bottom-[40px] z-40 overflow-y-auto ${isTopNav ? '' : 'ml-[60px]'}`}
+            style={{ borderRight: '1px solid var(--color-border)' }}
+          >
+            <GameTree
+              games={filteredGames}
+              collections={collections}
+              collectionIdsByRecord={collectionIdsByRecord}
+              /* Collections are a local-library concept — Browse and Wishlist
+                 keep the ungrouped list they already had. */
+              grouped={libraryMode === 'local'}
+              expandedIds={expandedCollectionIds}
+              onToggleExpanded={toggleCollectionExpanded}
+              selectedRecordId={selectedGame?.record_id}
+              onSelectGame={selectGame}
+              onGameContextMenu={openGameContextMenu}
+              emptyMessage={
+                libraryMode === 'catalog'
+                  ? 'No browse titles match these filters.'
+                  : libraryMode === 'wishlist'
+                    ? 'No wishlist entries yet.'
+                    : 'No games found'
+              }
+            />
+          </div>
+        )}
+
+
+        {/* Filter sidebar placement: side ('left'/'right') and mode
+            ('overlay'/'inline') both come from the active theme's
+            nav.filterSidebar block by default, independently overridable
+            in Settings > Appearance — see useTheme()/ThemeProvider.jsx.
+            In 'inline' mode the panel is a normal flex sibling of
+            #gameGrid (sharing horizontal space), so its DOM position
+            relative to #gameGrid — rendered before vs. after — is what
+            puts it on the left or right. When inline+left in sidebar
+            layout, it needs the SAME ml-[60px]/ml-[260px] left offset
+            #gameGrid uses below, since Sidebar.jsx and the library-list
+            panel are both `fixed` (out of flex flow) — without this
+            margin the inline panel would render underneath them instead
+            of after them. */}
+        {showSearchSidebar && !selectedGame && filterSidebarMode === 'inline' && filterSidebarSide === 'left' && (
+          <div className={isTopNav ? (showLibrarySidebar ? 'ml-[200px]' : '') : showLibrarySidebar ? 'ml-[260px]' : 'ml-[60px]'}>
+            <SearchSidebar
+              isVisible={showSearchSidebar}
+              searchText={activeFilters.text}
+              defaultSearchFieldIds={defaultSearchFieldIds}
+              activeFilters={activeFilters}
+              isCatalogMode={libraryMode === 'catalog'}
+              userSavedFilters={userSavedFilters}
+              mode="inline"
+              side="left"
+              onSearchChange={handleSearchChange}
+              onFilterChange={handleFilterChange}
+              onResetFilters={resetFilters}
+              onSavedFilterSaved={handleSavedFilterSaved}
+              activeSavedFilterId={activeSavedFilterId}
+              savedFilterDeleteStateById={savedFilterDeleteStateById}
+              onApplySavedFilter={applySavedFilter}
+              onDeleteSavedFilter={deleteSavedFilter}
+              onClose={() => setShowSearchSidebar(false)}
+            />
+          </div>
+        )}
+
+        <div
+          id="gameGrid"
+          className={`flex-1 min-h-0 flex flex-col bg-library ${
+            isTopNav
+              ? (showLibrarySidebar && !(showSearchSidebar && filterSidebarMode === 'inline' && filterSidebarSide === 'left' && !selectedGame) ? 'ml-[200px]' : '')
+              // When the inline-left filter sidebar is showing, IT already
+              // carries the ml-[60px]/ml-[260px] offset (see above) to
+              // clear the fixed Sidebar/library-list panel — applying the
+              // same margin here too would double it up as an extra gap
+              // between the filter panel and the grid.
+              : (showSearchSidebar && filterSidebarMode === 'inline' && filterSidebarSide === 'left' && !selectedGame)
+                ? ''
+                : showLibrarySidebar ? 'ml-[260px]' : 'ml-[60px]'
+          }`}
+          ref={gameGridRef}
+          // This element does NOT scroll. It used to, while the virtualized
+          // Grid nested inside it scrolled as well -- two scroll containers,
+          // so the working scrollbar (the Grid's) sat a scrollbar's width in
+          // from the edge with this one's empty track beside it. It is now a
+          // flex column: the status banners are fixed-height rows and the pane
+          // below them is the only thing that scrolls.
+          style={{ overflowX: 'hidden', overflowY: 'hidden' }}
+        >
+          {!selectedGame && libraryView !== 'collections' && activeCollection && (
+            <div className="flex-shrink-0 mx-3 mb-1 mt-3 flex items-center gap-3 rounded border border-border bg-secondary px-4 py-2 text-sm text-text">
+              <span className="flex-1">
+                Showing <strong>{activeCollection.name}</strong>
+              </span>
+              <button
+                onClick={openCollections}
+                className="flex-shrink-0 rounded bg-button px-3 py-1 hover:bg-buttonHover"
+              >
+                All Collections
+              </button>
+              <button
+                onClick={clearCollectionFilter}
+                title="Clear collection filter"
+                aria-label="Clear collection filter"
+                className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded hover:bg-tertiary"
+              >
+                <i className="fas fa-times" aria-hidden="true"></i>
+              </button>
+            </div>
+          )}
+          {!selectedGame && invalidMappingCount > 0 && !mappingBannerDismissed && (
+            <div className="flex-shrink-0 mx-3 mt-3 mb-1 flex items-center gap-3 rounded border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-text">
+              <i className="fas fa-triangle-exclamation text-amber-400" aria-hidden="true"></i>
+              <span className="flex-1">
+                {invalidMappingCount} game{invalidMappingCount === 1 ? '' : 's'} {invalidMappingCount === 1 ? 'has' : 'have'} a mapping that was removed from the remote catalog. Run a database audit to review and remap.
+              </span>
+              <button
+                onClick={() => window.electronAPI.openSettings?.()}
+                className="px-3 py-1 bg-button hover:bg-buttonHover rounded flex-shrink-0"
+              >
+                Open Settings
+              </button>
+              <button
+                onClick={() => setMappingBannerDismissed(true)}
+                title="Dismiss"
+                aria-label="Dismiss"
+                className="w-7 h-7 flex items-center justify-center rounded hover:bg-tertiary flex-shrink-0"
+              >
+                <i className="fas fa-times" aria-hidden="true"></i>
+              </button>
+            </div>
+          )}
+          {!selectedGame && mergeableCount > 0 && !mergeBannerDismissed && (
+            <div className="flex-shrink-0 mx-3 mt-3 mb-1 flex items-center gap-3 rounded border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-text">
+              <i className="fas fa-layer-group text-amber-400" aria-hidden="true"></i>
+              <span className="flex-1">
+                {mergeableCount} game{mergeableCount === 1 ? '' : 's'} in your library appear{mergeableCount === 1 ? 's' : ''} more than once and can be merged into a single game with selectable versions.
+              </span>
+              <button
+                onClick={() => window.electronAPI.openSettings?.()}
+                className="px-3 py-1 bg-button hover:bg-buttonHover rounded flex-shrink-0"
+              >
+                Open Settings
+              </button>
+              <button
+                onClick={() => setMergeBannerDismissed(true)}
+                title="Dismiss"
+                aria-label="Dismiss"
+                className="w-7 h-7 flex items-center justify-center rounded hover:bg-tertiary flex-shrink-0"
+              >
+                <i className="fas fa-times" aria-hidden="true"></i>
+              </button>
+            </div>
+          )}
+          {/* The only scroll container in this column.
+
+              In detail mode it scrolls, because GameDetailPage is far taller
+              than the window. In grid mode it must NOT: the virtualized Grid
+              does its own scrolling, and a scroller wrapping a scroller is
+              what produced the offset scrollbar with a dead strip beside it.
+              scrollbar-gutter keeps the detail pane's width constant whether
+              or not its content currently overflows. */}
+          <div
+            className={`flex-1 min-h-0 ${selectedGame ? 'overflow-y-auto library-scroll-pane' : 'overflow-hidden'}`}
+          >
+          {selectedGame ? (
+            <GameDetailPage
+              game={selectedGame}
+              onOpenUpdate={openUpdateModal}
+              onBack={goBackToLibrary}
+              onRefresh={refreshDetailGame}
+              onWishlistChanged={handleWishlistChanged}
+              openRatingFor={pendingRatingRecordId}
+              onRatingOpened={() => setPendingRatingRecordId(null)}
+            />
+          ) : libraryView === 'downloads' ? (
+            <DownloadsPage
+              gamesByRecordId={gamesByRecordId}
+              onOpenGame={selectGame}
+              onRequestInstall={(item) => installFlowRef.current?.requestInstall(item)}
+            />
+          ) : libraryView === 'collections' ? (
+            <CollectionsView
+              collections={collections}
+              artRecordIds={artRecordIds}
+              gamesByRecordId={gamesByRecordId}
+              loading={collectionsLoading}
+              onOpenCollection={openCollection}
+              onCreateCollection={() => {
+                setCollectionModalError('')
+                setCollectionModal({ mode: 'create', recordId: null })
+              }}
+              onCollectionContextMenu={handleCollectionContextMenu}
+            />
+          ) : filteredGames.length === 0 ? (
+            // Order matters: an index that is still building must NOT be
+            // reported as "no titles match", which is what a fresh install used
+            // to show for the whole first-launch build.
+            libraryMode === 'catalog' && catalogIndexState?.building ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+                <div
+                  className="h-10 w-10 animate-spin rounded-full border-4 border-border border-t-accent"
+                  role="status"
+                  aria-label="Preparing Browse"
+                />
+                <div className="text-text">Preparing Browse…</div>
+                <div className="text-xs text-muted max-w-sm">
+                  {catalogIndexState.progress?.message
+                    || 'Building the catalog index. This happens once, and your library stays usable while it runs.'}
+                </div>
+                {catalogIndexState.progress?.total > 0 && (
+                  <div className="h-1.5 w-56 overflow-hidden rounded bg-tertiary">
+                    <div
+                      className="h-full bg-accent transition-[width] duration-200"
+                      style={{
+                        width: `${Math.min(100, Math.round(
+                          (catalogIndexState.progress.processed / catalogIndexState.progress.total) * 100,
+                        ))}%`,
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            ) : libraryMode === 'catalog' && catalogLoading ? (
+              <div className="flex h-full items-center justify-center">
+                <div
+                  className="h-10 w-10 animate-spin rounded-full border-4 border-border border-t-accent"
+                  role="status"
+                  aria-label="Loading Browse titles"
+                />
+              </div>
+            ) : libraryLoadMismatch ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+                <i className="fas fa-triangle-exclamation text-2xl text-amber-400" aria-hidden="true" />
+                <div className="text-text">Your library did not load</div>
+                <div className="max-w-md text-xs text-muted">
+                  The database reports {expectedLibraryCount.toLocaleString()} game
+                  {expectedLibraryCount === 1 ? '' : 's'}
+                  {libraryStats?.versions
+                    ? ` and ${libraryStats.versions.toLocaleString()} version${libraryStats.versions === 1 ? '' : 's'}`
+                    : ''}
+                  , but none were returned. Your data is still there. Try reloading;
+                  if it keeps happening run Settings, Database, Full client check.
+                </div>
+                <button
+                  onClick={() => fetchGames(includeUninstalledRef.current)}
+                  className="rounded-buttonTheme bg-button px-4 py-2 text-sm hover:bg-buttonHover"
+                >
+                  Reload library
+                </button>
+              </div>
+            ) : libraryIsLoading ? (
+              // Never show an empty-library message while the fetch is still in
+              // flight, or when the database says there ARE records. get-games
+              // resolves every record's version list before returning, so on a
+              // large library there is a real window where the grid has no data
+              // yet — and "No games available" in that window reads as a lost
+              // library rather than as loading. Path validation and streamed art
+              // can extend it further.
+              <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+                <div
+                  className="h-10 w-10 animate-spin rounded-full border-4 border-border border-t-accent"
+                  role="status"
+                  aria-label={libraryMode === 'wishlist' ? 'Loading wishlist' : 'Loading library'}
+                />
+                <div className="text-text">
+                  {libraryMode === 'wishlist' ? 'Loading wishlist…' : 'Loading your library…'}
+                </div>
+                {libraryMode !== 'wishlist' && expectedLibraryCount > 0 && (
+                  <div className="text-xs text-muted">
+                    {expectedLibraryCount.toLocaleString()} game
+                    {expectedLibraryCount === 1 ? '' : 's'}
+                    {libraryStats?.versions
+                      ? ` and ${libraryStats.versions.toLocaleString()} version${libraryStats.versions === 1 ? '' : 's'}`
+                      : ''}
+                    {' '}in your database. Large libraries can take a moment, especially
+                    on a network drive.
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="flex h-full items-center justify-center text-center text-text">
+                {libraryMode === 'catalog'
+                  ? 'No browse titles match these filters.'
+                  : libraryMode === 'wishlist'
+                    ? 'No wishlist entries yet.'
+                    : hasActiveLibraryFilters
+                      ? 'No games match these filters.'
+                      : 'No games available'}
+              </div>
+            )
+          ) : (
+            <AutoSizer>
+              {({ height, width }) => {
+                // Two different widths, and using one where the other belongs
+                // is what leaves a gap:
+                //
+                //   width        the Grid ELEMENT's width. It must span the
+                //                whole pane, because the Grid draws its own
+                //                scrollbar inside this box. Passing a reduced
+                //                width here makes the whole Grid narrower than
+                //                its parent and strands empty pane to the right
+                //                of the scrollbar.
+                //   contentWidth what is left for cells once that scrollbar has
+                //                taken its share -- so the column count and
+                //                column width are computed from this, or the
+                //                last column is sized into space the scrollbar
+                //                occupies and gets clipped.
+                const contentWidth = Math.max(0, width - scrollbarSize)
+                const currentColumnCount = getColumnCountForWidth(contentWidth)
+                const currentColumnWidth = currentColumnCount > 1
+                  ? Math.max(bannerSize.bannerWidth + (bannerSize.shadowEnabled ? 24 : 16), contentWidth / currentColumnCount)
+                  : Math.max(contentWidth, bannerSize.bannerWidth + (bannerSize.shadowEnabled ? 24 : 16))
+                const currentRowCount = Math.ceil(filteredGames.length / currentColumnCount)
+                return (
+                  <Grid
+                    ref={gridRef}
+                    columnCount={currentColumnCount}
+                    columnWidth={currentColumnWidth}
+                    rowCount={currentRowCount}
+                    rowHeight={bannerSize.bannerHeight + (bannerSize.shadowEnabled ? 48 : 16)}
+                    height={height}
+                    width={width}
+                    cellRenderer={getCellRenderer(currentColumnCount)}
+                    onScroll={({ scrollTop }) => {
+                      if (pendingLibraryScrollTopRestoreRef.current === null) {
+                        libraryScrollTopRef.current = scrollTop || 0
+                      }
+                    }}
+                    onSectionRendered={({ rowStartIndex, rowStopIndex }) => {
+                      if (libraryMode !== 'catalog') return
+                      requestCatalogRange(
+                        rowStartIndex * currentColumnCount,
+                        (rowStopIndex + 1) * currentColumnCount - 1,
+                      )
+                    }}
+                    // 'scroll' not 'auto': the track is always drawn, so a
+                    // filter that narrows the results below one screenful
+                    // cannot make the grid jump sideways.
+                    style={{ overflowX: 'hidden', overflowY: 'scroll' }}
+                  />
+                )
+              }}
+            </AutoSizer>
+          )}
+          </div>
+          {/* Page-fetch indicator. This has to render as a SIBLING of the grid,
+              not inside the empty-state branch: once the first page resolves,
+              catalogGames becomes Array(total).fill(null), so filteredGames is
+              non-empty and the centred spinner above is unreachable from then on.
+              A stalled scroll fetch therefore showed blank cells and nothing
+              else. Deliberately a small corner pill rather than a blocking
+              overlay — the loaded rows stay usable while another page arrives.
+
+              Positioned `fixed` rather than `absolute`: the only enclosing
+              positioned candidate is #gameGrid, which is overflow-y-auto, so an
+              absolute child anchors to the full scroll height and scrolls out of
+              view. bottom-16 clears the footer. */}
+          {!selectedGame && libraryMode === 'catalog' && catalogLoadingMore && !catalogLoading && (
+            <div
+              className="pointer-events-none fixed bottom-16 right-6 z-40 flex items-center gap-2 rounded-full border border-border bg-primary/90 px-3 py-1.5 text-xs text-text shadow-lg"
+              role="status"
+              aria-live="polite"
+            >
+              <span
+                className="h-3 w-3 animate-spin rounded-full border-2 border-border border-t-accent"
+                aria-hidden="true"
+              />
+              Loading more titles…
+            </div>
+          )}
+          {!selectedGame && libraryMode === 'catalog' && catalogLoadError && (
+            <div className="py-4 text-center text-sm text-danger">
+              Browse load failed: {catalogLoadError}
+            </div>
+          )}
+        </div>
+
+        {showSearchSidebar && !selectedGame && filterSidebarMode === 'inline' && filterSidebarSide === 'right' && (
+          <SearchSidebar
+            isVisible={showSearchSidebar}
+            searchText={activeFilters.text}
+            defaultSearchFieldIds={defaultSearchFieldIds}
+            activeFilters={activeFilters}
+            isCatalogMode={libraryMode === 'catalog'}
+            userSavedFilters={userSavedFilters}
+            mode="inline"
+            side="right"
+            onSearchChange={handleSearchChange}
+            onFilterChange={handleFilterChange}
+            onResetFilters={resetFilters}
+            onSavedFilterSaved={handleSavedFilterSaved}
+            activeSavedFilterId={activeSavedFilterId}
+            savedFilterDeleteStateById={savedFilterDeleteStateById}
+            onApplySavedFilter={applySavedFilter}
+            onDeleteSavedFilter={deleteSavedFilter}
+            onClose={() => setShowSearchSidebar(false)}
+          />
+        )}
+
+        {showSearchSidebar && !selectedGame && filterSidebarMode !== 'inline' && (
+          <SearchSidebar
+            isVisible={showSearchSidebar}
+            searchText={activeFilters.text}
+            defaultSearchFieldIds={defaultSearchFieldIds}
+            activeFilters={activeFilters}
+            isCatalogMode={libraryMode === 'catalog'}
+            userSavedFilters={userSavedFilters}
+            mode="overlay"
+            side={filterSidebarSide}
+            onSearchChange={handleSearchChange}
+            onFilterChange={handleFilterChange}
+            onResetFilters={resetFilters}
+            onSavedFilterSaved={handleSavedFilterSaved}
+            activeSavedFilterId={activeSavedFilterId}
+            savedFilterDeleteStateById={savedFilterDeleteStateById}
+            onApplySavedFilter={applySavedFilter}
+            onDeleteSavedFilter={deleteSavedFilter}
+            onClose={() => setShowSearchSidebar(false)}
+          />
+        )}
+      </div>
+
+      {/* Progress bars */}
+      {dbUpdateStatus.text && (
+        <div className="absolute bottom-[44px] left-1/2 transform -translate-x-1/2 w-[600px] bg-primary flex items-center justify-center p-2 z-[1500] border border-border opacity-95">
+          <div className="flex items-center w-[540px]">
+            <span className="w-[300px] text-[10px] text-text">{dbUpdateStatus.text}</span>
+            <div className="relative w-[300px]">
+              <div className="h-[15px] bg-progressBackground rounded overflow-hidden">
+                <div className="h-full bg-progressForeground" style={{ width: `${(dbUpdateStatus.progress / (dbUpdateStatus.total || 1)) * 100}%` }}></div>
+              </div>
+              <span className="absolute inset-0 flex items-center justify-center text-[10px] text-text">
+                {/* Floor-plus-one, not the raw value. Progress is fractional
+                    within a package now so the bar can move during a download
+                    (see electron/db/updateProgress.js), and formatProgressNumber
+                    would render that as "Update 3.4/25". This names the package
+                    being worked on, which also fixes the old label opening on
+                    "Update 0/25" before anything had finished. */}
+                Update {formatProgressNumber(
+                  Math.min(Math.floor(Math.max(dbUpdateStatus.progress, 0)) + 1, dbUpdateStatus.total),
+                )}/{formatProgressNumber(dbUpdateStatus.total)}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {importStatus.text && (
+        <div className="absolute bottom-[60px] left-1/2 transform -translate-x-1/2 w-[600px] bg-primary flex items-center justify-center p-2 z-[1500]">
+          <div className="flex items-center w-[540px]">
+            <span className="w-[300px] text-[10px] text-text">{importStatus.text}</span>
+            <div className="relative w-[300px]">
+              <div className="h-[15px] bg-progressBackground rounded overflow-hidden">
+                <div className="h-full bg-progressForeground" style={{ width: `${(importStatus.progress / importStatus.total) * 100}%` }}></div>
+              </div>
+              <span className="absolute inset-0 flex items-center justify-center text-[10px] text-text">
+                File {formatProgressNumber(importStatus.progress, { clamp: false })}/{formatProgressNumber(importStatus.total, { clamp: false })}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <CollectionModal
+        open={Boolean(collectionModal)}
+        mode={collectionModal?.mode || 'create'}
+        initialName={collectionModal?.name || ''}
+        initialColor={collectionModal?.color || undefined}
+        busy={collectionModalBusy}
+        error={collectionModalError}
+        onSubmit={submitCollectionModal}
+        onCancel={closeCollectionModal}
+      />
+
+      <ContextMenu
+        open={Boolean(gameMenu)}
+        x={gameMenu?.x || 0}
+        y={gameMenu?.y || 0}
+        items={gameMenu?.items || []}
+        onClose={() => setGameMenu(null)}
+        onAction={runGameContextAction}
+      />
+
+      <BulkTagModal
+        open={Boolean(bulkTagTarget)}
+        collectionName={bulkTagTarget?.name || ''}
+        recordIds={bulkTagRecordIds}
+        presentTags={bulkTagPresentTags}
+        onClose={() => setBulkTagTarget(null)}
+        onApplied={() => fetchGames()}
+      />
+
+      {/* Deleting a collection never deletes games — say so plainly, since
+          "delete collection" reads as destructive. */}
+      {pendingCollectionDelete && (
+        <div
+          className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setPendingCollectionDelete(null)}
+        >
+          <div
+            className="w-full max-w-sm rounded border border-border bg-primary p-4 shadow-xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3 className="mb-2 text-sm font-semibold text-text">Delete Collection</h3>
+            <p className="text-sm text-text">
+              Delete <strong>{pendingCollectionDelete.name}</strong>?
+            </p>
+            <p className="mt-2 text-xs text-muted">
+              The titles in it stay in your library and become uncategorized.
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingCollectionDelete(null)}
+                className="rounded-buttonTheme bg-button px-3 py-1.5 text-sm text-text hover:bg-buttonHover"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const target = pendingCollectionDelete
+                  setPendingCollectionDelete(null)
+                  deleteCollection({ id: target.id, name: target.name })
+                }}
+                className="rounded-buttonTheme bg-danger px-3 py-1.5 text-sm text-white hover:bg-dangerHover"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {importProgress.text && (
+        <div className="absolute bottom-[60px] left-1/2 transform -translate-x-1/2 w-[900px] bg-primary flex items-center justify-center p-2 z-[1500] border border-border opacity-95">
+          <div className="flex items-center w-[880px] gap-2">
+            <span className="w-[450px] text-[10px] text-text">{importProgress.text}</span>
+            <div className="relative w-[300px]">
+              <div className="h-[15px] bg-progressBackground rounded overflow-hidden">
+                <div className="h-full bg-progressForeground" style={{ width: `${(importProgress.progress / (importProgress.total || 1)) * 100}%` }}></div>
+              </div>
+              <span
+                className="absolute inset-0 flex items-center justify-center gap-1 px-1 text-[10px] text-text overflow-hidden whitespace-nowrap"
+                title={importProgress.title || undefined}
+              >
+                {importProgress.percent != null || importProgress.phase === 'extracting' ? (
+                  <>
+                    {importProgress.title && (
+                      <span className="min-w-0 overflow-hidden text-ellipsis">{importProgress.title}</span>
+                    )}
+                    <span className="shrink-0">
+                      {formatPercent(importProgress.percent ?? importProgress.progress)}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    Game {formatProgressNumber(importProgress.progress, { clamp: false })}/{formatProgressNumber(importProgress.total, { clamp: false })}
+                  </>
+                )}
+              </span>
+            </div>
+            {importProgress.canCancel && (
+              <button onClick={cancelImport} className="bg-danger hover:bg-dangerHover px-3 py-1 text-[10px] text-white">
+                Cancel Import
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* App-update notice is now shown via the toast system (see the
+          appUpdateNotice -> toast bridge effect above), replacing the old
+          full-width bottom bar. */}
+
+      {/* Footer — position:fixed, same reasoning as the header above: it
+          escapes the root div's own rounded clip, so it needs its own
+          matching bottom-corner rounding directly (just border-radius,
+          no overflow-hidden — dropdowns above open upward past this bar's
+          top edge and would get clipped off by it). */}
+      <div className="bg-primary h-[40px] grid grid-cols-[1fr_auto_1fr] items-center px-4 fixed bottom-0 w-full border-t border-accent z-50 rounded-b-windowTheme transform-gpu">
+        <button
+          type="button"
+          onClick={openWishlist}
+          className="justify-self-start flex items-center bg-transparent text-text hover:text-highlight"
+        >
+          <i className="fas fa-bookmark mr-2 text-text"></i>Wishlist
+        </button>
+        <div className="justify-self-center flex items-center text-center">
+          <i className="fas fa-gamepad mr-2 text-text"></i>
+          <span>
+            {libraryMode === 'catalog'
+              ? `${catalogTotal !== null ? catalogTotal : filteredGames.length} Browse Titles${catalogTotal !== null ? ` (${catalogLoadedCount} loaded)` : ''}`
+              : libraryMode === 'wishlist'
+                ? `${filteredGames.length} Wishlist ${filteredGames.length === 1 ? 'Entry' : 'Entries'}`
+              : activeFilters.includeUninstalled
+              ? `${installedGameCount} Games Installed, ${uninstalledGameCount} Uninstalled, ${totalVersions} Total Versions`
+              : `${installedGameCount} Games Installed, ${totalVersions} Total Versions`}
+          </span>
+        </div>
+        <div className="justify-self-end flex items-center h-full">
+          <DownloadsStatus
+            onOpen={openDownloads}
+            active={libraryView === 'downloads'}
+          />
+        </div>
+      </div>
+
+      {/* First-run NSFW / adult-content opt-in prompt. Shown once, only
+          when config.ini has never recorded an answer (see
+          electron/ipc/settings.js's get-nsfw-status `configured` flag) —
+          not whenever the answer happens to be "no". Answering either way
+          persists immediately via setNsfwEnabled and never shows again;
+          the choice can still be changed later from Settings > Interface. */}
+      {nsfwPromptOpen && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-secondary p-6 rounded-cardTheme max-w-md w-full text-text">
+            <h2 className="text-lg font-semibold mb-3">Enable Adult (18+) Content?</h2>
+            <p className="text-sm opacity-80 mb-5">
+              Atlas can optionally include adult-oriented games and visual novels in
+              Browse mode, with metadata sourced from third-party sites. This content
+              is intended for adults only. Would you like to enable it?
+            </p>
+            <div className="flex justify-end gap-3">
+              <button
+                onClick={() => handleNsfwChoice(false)}
+                className="px-4 py-2 rounded bg-button hover:bg-buttonHover transition-colors duration-200"
+              >
+                No
+              </button>
+              <button
+                onClick={() => handleNsfwChoice(true)}
+                className="px-4 py-2 rounded bg-accent hover:bg-accentHover transition-colors duration-200"
+              >
+                Yes, I am 18 or older
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <WelcomePage
+        open={showWelcome}
+        onGetStarted={handleWelcomeDone}
+        version={version}
+      />
+
+      <AboutModal
+        open={aboutOpen}
+        onClose={() => setAboutOpen(false)}
+        version={version}
+        onReplayTour={replayWelcomeTour}
+      />
+
+      <WelcomeTour
+        open={showWelcomeTour}
+        onClose={handleWelcomeTourClose}
+      />
+
+      <UpdateModal
+        game={updateModalGame}
+        open={Boolean(updateModalGame)}
+        onClose={() => setUpdateModalGame(null)}
+      />
+
+      <RefreshMediaModal
+        open={refreshLibraryModalOpen}
+        scope="library"
+        busy={refreshLibraryBusy}
+        progress={refreshLibraryProgress}
+        onConfirm={confirmLibraryRefresh}
+        onClose={() => { if (!refreshLibraryBusy) setRefreshLibraryModalOpen(false) }}
+      />
+
+      <LibraryUpdateModal
+        open={libraryUpdateModalOpen}
+        updateCount={updatableGames.length}
+        onChoose={handleLibraryUpdateChoice}
+        onClose={() => setLibraryUpdateModalOpen(false)}
+      />
+
+      <UpdateAllSession
+        open={updateAllOpen}
+        games={updatableGames}
+        onClose={() => setUpdateAllOpen(false)}
+      />
+
+      {/* The install dialog and its setup prompts, hoisted out of DownloadsPage
+          so a download finishing while the user is anywhere else still has
+          somewhere to put its confirmation. See InstallFlowHost.jsx.
+
+          `blocked` is App's own modal state, not a registry every modal signs
+          up to. That was the cheaper option and it changes no existing
+          component, but it does mean a modal App does not know about — the
+          rating dialog inside GameDetailPage, for one — will not hold a prompt
+          back. Worth revisiting if that becomes a real collision rather than a
+          theoretical one. */}
+      <InstallFlowHost
+        ref={installFlowRef}
+        blocked={
+          Boolean(updateModalGame) || refreshLibraryModalOpen || libraryUpdateModalOpen ||
+          updateAllOpen || aboutOpen || showWelcomeTour || showWelcome || nsfwPromptOpen ||
+          Boolean(collectionModal) || Boolean(pendingCollectionDelete) || Boolean(bulkTagTarget)
+        }
+        onInstalled={(result) => {
+          // skipPathValidation is NOT optional here. Without it, getGames maps
+          // every version of every game through mapVersionRow, which runs a
+          // synchronous fs.existsSync on both game_path and exec_path — two
+          // blocking stats per version, across the whole library, on the main
+          // process. On an SSD that is invisible. On a 6k-game library on a
+          // mechanical drive it is thousands of seeks and the app stops
+          // responding, which is what a user reported as "all version folders
+          // are being scanned after an install".
+          //
+          // Validation is meant to be the deliberate, throttled pass in
+          // validate-library-paths (one record at a time, yielding every 25,
+          // gated behind Library.validatePathsOnStartup). An install is not a
+          // request to re-verify the entire library.
+          //
+          // The versions of the game just installed are still verified: the
+          // install handler broadcasts game-updated with a full getGame()
+          // record, and that one DOES stat its own versions.
+          if (result?.success) fetchGames(includeUninstalledRef.current, { skipPathValidation: true })
+        }}
+      />
+
+    </div>
+  )
+}
+
+export default App

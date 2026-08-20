@@ -1,0 +1,5084 @@
+'use strict'
+
+const { ipcMain, dialog, BrowserWindow, app } = require('electron')
+const { downloadImages, buildBannerBaseName } = require('../imageUtils')
+const path = require('path')
+const fs = require('fs')
+const fsp = require('fs').promises
+const cp = require('child_process')
+const ini = require('ini')
+const { Worker } = require('worker_threads')
+const { calculatePathSize } = require('../pathSize')
+const { getImportRecordStatus, getAtlasData, findExistingRecordForImport,
+        checkRecordExist, checkPathExist } = require('../db/atlas')
+// getVersionPathsForRecord is used inside replaceInstalledVersionAfterImport
+// but was never imported. Same latent bug as the bare `db`: the only prior
+// caller passes deleteDatabaseRow:false and never reaches those lines, so
+// nothing exercised them until the download install path enabled the delete.
+const { getGame, getVersionPathsForRecord } = require('../db/versions')
+const { toLocalRecordId } = require('../downloads/recordId')
+// db/index exposes `db` as a getter populated after initializeDatabase().
+// Read through the module at call time; capturing it at require time
+// would bind null.
+const dbModule = require('../db/index')
+const { fetchAndStoreSteamData, isSteamAppInstalled } = require('../scanners/steamscanner')
+const { fetchAndStoreGogData, startGogScan } = require('../scanners/gogscanner')
+const { findExecutables } = require("../scanners/executableScanner");
+const { getDefaultRenpySaveRoot, scanRenpySaveFolders } = require("../scanners/renpySaveScanner");
+const { findRecordBySteamId, recordHasSteamMapping, uniqueSteamVersionLabel, findAtlasBySteamId } = require('../db/steam')
+const { findRecordByGogId, addGogMapping, getGogIDbyRecord } = require('../db/gog')
+// Required at MODULE level, not taken through ctx, because the functions below
+// that use them are themselves at module level and cannot see a binding created
+// inside registerImporterHandlers(). That mismatch is what made version replace
+// throw `recentlyDeletedGamePaths is not defined` on every single attempt while
+// every in-handler caller worked -- see library/recentlyDeleted.js.
+const { getVersionForRecord } = require('../db/versions')
+const { deleteVersion } = require('../db/games')
+const recentlyDeleted = require('../library/recentlyDeleted')
+const { buildDefaultConfig } = require('../config/configSchema')
+// One implementation of catalog-entry -> library-record, shared by the
+// drag-and-drop importer below and the Browse-download promotion in
+// downloads-install. See library/catalogRecord.js for the resolution order and
+// why it is not a second copy.
+const { resolveCatalogRecord, ensureCatalogRecord } = require('../library/catalogRecord')
+const { getCatalogEntryByRef } = require('../db/catalogEntry')
+const { toCatalogRef, describeCatalogRef } = require('../library/catalogRef')
+const {
+  addLewdCornerMapping,
+  findRecordByLewdCornerId,
+  parseLewdCornerIdFromUrl,
+  searchAtlasByLewdCornerId,
+} = require('../db/lewdcorner')
+const { deletePathWithElevationFallback } = require('../deleteUtils')
+const { backupSaveArtifacts, restoreSaveArtifacts } = require('../utils/savePreservation')
+const { buildSevenZipCandidates, canRunSevenZip } = require('../utils/sevenZipDetect')
+const {
+  describeProvider,
+  readProviderLibrary,
+  listProviders,
+  getProvider,
+} = require('../scanners/externalLibrary')
+const {
+  applyExternalLibraryState,
+  makeCollectionResolver,
+} = require('../scanners/externalLibrary/applyState')
+const { addWishlistEntry } = require('../db/wishlist')
+
+let ownerMainWindow = null
+let nextScanId = 1
+
+// The registration context, kept at module scope so module-level helpers can
+// reach the *current* app config. `ctx.appConfig` is replaced wholesale every
+// time settings are saved (e.g. set-default-game-folder), so anything that
+// captured the config object at registration time goes stale immediately — which
+// is how "Default library folder is not set" could fire right after the user
+// picked a folder.
+let handlerCtx = null;
+const getLiveConfig = () => handlerCtx?.appConfig || {};
+
+// Closes the import wizard if it's open. `ctx.importerWindow` is a live getter
+// in main.js, so this always sees the current window (or null).
+const closeImporterWindow = () => {
+  const win = handlerCtx?.importerWindow;
+  if (win && !win.isDestroyed()) win.close();
+};
+
+const clampInteger = (value, fallback, min, max) => {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+};
+
+const getMediaPerformanceSettings = (config) => {
+  const performance = config?.Performance || {};
+  return {
+    mediaDownloadConcurrency: clampInteger(performance.mediaDownloadConcurrency, 3, 1, 8),
+    mediaPerHostConcurrency: clampInteger(performance.mediaPerHostConcurrency, 2, 1, 5),
+    mediaRequestDelayMs: clampInteger(performance.mediaRequestDelayMs, 100, 0, 5000),
+  };
+};
+
+const createHostLimiter = () => {
+  const runningByHost = new Map();
+  const waitersByHost = new Map();
+
+  const waitForHostSlot = async (host, limit) => {
+    const key = host || "unknown";
+    while ((runningByHost.get(key) || 0) >= limit) {
+      await new Promise((resolve) => {
+        const waiters = waitersByHost.get(key) || [];
+        waiters.push(resolve);
+        waitersByHost.set(key, waiters);
+      });
+    }
+    runningByHost.set(key, (runningByHost.get(key) || 0) + 1);
+    return () => {
+      const nextCount = Math.max(0, (runningByHost.get(key) || 1) - 1);
+      if (nextCount === 0) runningByHost.delete(key);
+      else runningByHost.set(key, nextCount);
+      const waiters = waitersByHost.get(key) || [];
+      const nextWaiter = waiters.shift();
+      if (waiters.length === 0) waitersByHost.delete(key);
+      else waitersByHost.set(key, waiters);
+      if (nextWaiter) nextWaiter();
+    };
+  };
+
+  return { waitForHostSlot };
+};
+
+const runConcurrentQueue = async (items, concurrency, worker) => {
+  let index = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, async () => {
+    while (index < items.length) {
+      const item = items[index++];
+      await worker(item);
+    }
+  });
+  await Promise.all(workers);
+};
+
+const getUrlHost = (value) => {
+  try {
+    return new URL(String(value || "")).host.toLowerCase();
+  } catch {
+    return "";
+  }
+};
+
+// ── Importer helper functions ──────────────────────────────────────
+
+// Pure import rules now live in library/importRules.js. Destructured so every
+// existing call site in this file is unchanged.
+const {
+  sanitizePathSegment,
+  normalizeVersionName,
+  buildStructuredImportPath,
+  toPositiveInteger,
+  getLewdCornerIdFromGame,
+  TARBALL_SUFFIXES,
+  isCompoundTarballPath,
+  getArchiveExtension,
+  getConfiguredExtractionExtensions,
+  isArchiveFilePath,
+  isRarArchivePath,
+  isSteamImportRow,
+  getSteamIdFromGame,
+  isGogImportRow,
+  getGogIdFromGame,
+  inferCatalogImportVersion,
+  getConfiguredGameExtensions,
+} = require('../library/importRules');
+
+function resolveArchivePathForImport(game, archiveFilename) {
+  const candidates = [];
+  if (game?.folder) candidates.push(String(game.folder));
+  if (game?.sourceFile) candidates.push(String(game.sourceFile));
+  if (game?.folder && archiveFilename) {
+    candidates.push(path.join(String(game.folder), archiveFilename));
+  }
+
+  const archivePath = candidates.find((candidate) => {
+    try {
+      return candidate && fs.existsSync(candidate) && fs.statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  });
+
+  if (!archivePath) {
+    throw new Error(
+      `Archive not found: ${candidates.filter(Boolean).join(" or ") || "no archive path supplied"}`,
+    );
+  }
+
+  return archivePath;
+}
+
+function getUniquePath(basePath) {
+  let uniquePath = basePath;
+  let counter = 1;
+  while (fs.existsSync(uniquePath)) {
+    uniquePath = `${basePath} (${counter++})`;
+  }
+  return uniquePath;
+}
+
+const dbGet = (db, sql, params = []) =>
+  new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row || null);
+    });
+  });
+
+const dbRun = (db, sql, params = []) =>
+  new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+
+const calculatePathSizeSafe = async (targetPath) => {
+  try {
+    const result = await calculatePathSize(targetPath);
+    return result?.missing ? null : result?.sizeBytes ?? null;
+  } catch (err) {
+    console.warn(`Failed to calculate imported folder size for ${targetPath}:`, err.message || err);
+    return null;
+  }
+};
+
+function getUniqueTempPath(basePath) {
+  return getUniquePath(`${basePath}.__atlas_extract_${Date.now()}`);
+}
+
+// getSingleDirectoryChild() removed: its only caller was
+// getNormalizedArchiveRoot(), itself dead. Orphaned by that removal, which is
+// the cascade scripts/check-ipc-dead-code.js exists to keep finding.
+
+
+// getNormalizedArchiveRoot() removed: no callers. The live path flattens a
+// single wrapped folder inline in downloads-install and import-catalog-entry.
+
+
+// moveFolderFast() removed: it had no callers, and its EXDEV fallback called
+// copyFolderWithProgress(), which is not defined anywhere in the codebase. A
+// cross-device move would have thrown a ReferenceError, so the dead code was
+// hiding a broken implementation rather than an unused working one.
+
+
+// getArchiveInfo() removed: no callers.
+
+
+/**
+ * If an extraction produced nothing but a single .tar, extract that too.
+ *
+ * 7-Zip treats compression and archiving as separate layers, so `.tar.bz2`
+ * decompresses to `.tar` and stops. The import then finds one opaque file, no
+ * executable, and the title lands unplayable.
+ *
+ * Runs at most twice. Only acts when the extracted output is a LONE tar file:
+ * an archive that legitimately ships a .tar alongside other content is left
+ * alone, since unwrapping it there would scatter its contents.
+ */
+async function unwrapNestedTarball(targetDir, sevenZipBin, session, depth = 0) {
+  if (depth >= 2 || !sevenZipBin) return;
+  let entries;
+  try {
+    entries = await fsp.readdir(targetDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const visible = entries.filter(
+    (entry) => !entry.name.startsWith(".") && !entry.name.startsWith("__MACOSX"),
+  );
+  if (visible.length !== 1 || !visible[0].isFile()) return;
+  if (!visible[0].name.toLowerCase().endsWith(".tar")) return;
+
+  const tarPath = path.join(targetDir, visible[0].name);
+  console.log(`Unwrapping nested tar: ${tarPath}`);
+  try {
+    throwIfImportCanceled(session);
+    await new Promise((resolve, reject) => {
+      cp.execFile(
+        sevenZipBin,
+        ["x", tarPath, `-o${targetDir}`, "-y"],
+        { windowsHide: true, maxBuffer: 1024 * 1024 * 16 },
+        (err, stdout, stderr) => {
+          if (err) reject(new Error(stderr || err.message));
+          else resolve();
+        },
+      );
+    });
+  } catch (err) {
+    // The outer extraction already succeeded, so leave the .tar in place rather
+    // than failing the whole import; the title is still recoverable by hand.
+    console.warn(`Failed to unwrap ${tarPath}:`, err.message || err);
+    return;
+  }
+  await removePathIfExists(tarPath, targetDir);
+  // A .tar.gz.tar is pathological but cheap to handle.
+  await unwrapNestedTarball(targetDir, sevenZipBin, session, depth + 1);
+}
+
+async function extractArchive(
+  archivePath,
+  finalPath,
+  sevenZipBin,
+  session,
+  progressWindow,
+  useBundledRarExtractor = false,
+  label = "",
+  containmentRoot = null,
+) {
+  // Staging and failure cleanup both delete inside this tree, so it has to be
+  // named explicitly rather than inferred from the path being removed.
+  const cleanupRoot = containmentRoot || path.dirname(path.resolve(finalPath));
+  const workerPath = resolvePackagedModulePath(
+    path.join(__dirname, "../../workers/extractWorker.js"),
+  );
+  const tempPath = getUniqueTempPath(finalPath);
+  console.log("Worker path:", workerPath);
+  if (!fs.existsSync(workerPath)) {
+    throw new Error(`Worker file not found: ${workerPath}`);
+  }
+
+  await fsp.mkdir(tempPath, { recursive: true });
+  session?.cleanupPaths?.push(tempPath);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const worker = new Worker(workerPath, {
+      workerData: {
+        archivePath,
+        extractPath: tempPath,
+        sevenZipBin,
+        useBundledRarExtractor,
+        rarWasmPath: useBundledRarExtractor
+          ? resolvePackagedModulePath(require.resolve("node-unrar-js/dist/js/unrar.wasm"))
+          : null,
+      },
+    });
+    if (session) session.currentExtractionWorker = worker;
+
+    const cleanupWorker = () => {
+      if (session?.currentExtractionWorker === worker) {
+        session.currentExtractionWorker = null;
+      }
+      worker.terminate().catch(() => {});
+    };
+
+    const settle = (callback) => {
+      if (settled) return;
+      settled = true;
+      cleanupWorker();
+      callback();
+    };
+    worker.on("message", (msg) => {
+      if (msg.type === "progress") {
+        if (progressWindow && !progressWindow.isDestroyed()) {
+          // `title`/`percent` are passed through so the renderer can label the
+          // progress bar with the game being extracted instead of the
+          // meaningless "Game 42/100" it derives from progress/total.
+          progressWindow.webContents.send("import-progress", {
+            text: label ? `${label} \u2014 ${msg.text}` : msg.text,
+            title: label || null,
+            percent: typeof msg.percent === "number" ? msg.percent : null,
+            progress:
+              typeof msg.percent === "number"
+                ? msg.percent
+                : session?.progress || 0,
+            total: 100,
+            phase: msg.phase,
+            canCancel: true,
+          });
+        } else {
+          console.warn("[MAIN] import progress window not available");
+        }
+      } else if (msg.type === "done") {
+        settle(async () => {
+          if (!msg.success) {
+            await removePathIfExists(tempPath, cleanupRoot);
+            if (msg.canceled) reject(createImportCancelledError());
+            else reject(new Error(msg.error || "Extraction failed"));
+            return;
+          }
+
+          try {
+            throwIfImportCanceled(session);
+            await fsp.mkdir(path.dirname(finalPath), { recursive: true });
+            if (fs.existsSync(finalPath)) {
+              finalPath = getUniquePath(finalPath);
+            }
+            await moveDirWithRetry(tempPath, finalPath, { containmentRoot: cleanupRoot });
+            // One 7-Zip pass on a .tar.bz2 strips only the compression and
+            // leaves the .tar sitting there, which then imports as a single
+            // file with no executable inside. Unwrap it.
+            await unwrapNestedTarball(finalPath, sevenZipBin, session);
+            resolve({ success: true, finalPath });
+          } catch (err) {
+            await removePathIfExists(tempPath, cleanupRoot);
+            reject(err);
+          }
+        });
+      }
+    });
+    worker.on("error", (err) => {
+      settle(async () => {
+        await removePathIfExists(tempPath, cleanupRoot);
+        reject(err);
+      });
+    });
+    worker.on("exit", (code) => {
+      if (code !== 0) {
+        settle(async () => {
+          await removePathIfExists(tempPath, cleanupRoot);
+          reject(new Error(`Worker stopped with exit code ${code}`));
+        });
+      }
+    });
+
+    if (session?.cancelRequested) {
+      worker.postMessage("cancel");
+    }
+  });
+}
+
+// Wraps extractArchive with a one-time recovery path. If a RAR fails to
+// extract with the bundled node-unrar-js engine (the source of the
+// "cannot read properties of null" / "no end of archive" issues on some
+// archives), prompt the user to locate a 7-Zip executable and retry the
+// extraction through the (hardened) 7-Zip spawn path instead. The chosen
+// 7-Zip path is persisted to config by resolveSevenZipExecutablePath, so
+// subsequent imports reuse it automatically.
+async function extractArchiveWithFallback({
+  archivePath,
+  finalPath,
+  sevenZipBin,
+  session,
+  progressWindow,
+  useBundledRarExtractor,
+  currentConfig,
+  currentConfigPath,
+  ownerWindow,
+  notify,
+  label = "",
+  containmentRoot = null,
+}) {
+  try {
+    return await extractArchive(
+      archivePath,
+      finalPath,
+      sevenZipBin,
+      session,
+      progressWindow,
+      useBundledRarExtractor,
+      label,
+      containmentRoot,
+    );
+  } catch (err) {
+    // Never interfere with cancellation, and only offer the fallback for the
+    // case it actually helps: a RAR that failed via the bundled extractor.
+    if (
+      isImportCancelledError(err) ||
+      session?.cancelRequested ||
+      !isRarArchivePath(archivePath) ||
+      !useBundledRarExtractor
+    ) {
+      throw err;
+    }
+
+    console.warn(
+      `[Importer] Bundled RAR extraction failed for ${archivePath}: ${
+        err?.message || err
+      }. Offering 7-Zip fallback.`,
+    );
+
+    const choice = await showMessageBox(ownerWindow, {
+      type: "warning",
+      buttons: ["Locate 7-Zip and retry", "Cancel"],
+      defaultId: 0,
+      cancelId: 1,
+      title: "Extraction failed",
+      message: `Atlas could not extract this RAR archive with its built-in extractor.`,
+      detail:
+        `${path.basename(archivePath)}\n\n` +
+        `You can point Atlas at a 7-Zip executable (7z, 7za, or 7zz) to ` +
+        `retry. This path will be saved for future imports.\n\n` +
+        `Error: ${err?.message || err}`,
+    });
+
+    if (choice.response !== 0) {
+      throw err;
+    }
+
+    const resolved = await resolveSevenZipExecutablePath({
+      configuredPath: currentConfig?.Library?.sevenZipPath,
+      currentConfig,
+      currentConfigPath,
+      ownerWindow,
+      notify,
+      allowManualSelection: true,
+    });
+
+    if (!resolved?.path) {
+      // User dismissed the picker or chose an invalid binary; surface the
+      // original extraction error rather than a confusing secondary one.
+      throw err;
+    }
+
+    notify?.(`Retrying extraction with ${getSevenZipDisplayName(resolved.path)}...`);
+    // Force the 7-Zip spawn path (useBundledRarExtractor = false) regardless
+    // of the resolved source, since the bundled engine already failed.
+    return await extractArchive(
+      archivePath,
+      finalPath,
+      resolved.path,
+      session,
+      progressWindow,
+      false,
+      label,
+      containmentRoot,
+    );
+  }
+}
+
+function resolvePackagedModulePath(modulePath) {
+  if (app.isPackaged && modulePath.includes(`${path.sep}app.asar${path.sep}`)) {
+    return modulePath.replace(
+      `${path.sep}app.asar${path.sep}`,
+      `${path.sep}app.asar.unpacked${path.sep}`,
+    );
+  }
+  return modulePath;
+}
+
+function getSevenZipExecutablePath() {
+  return resolvePackagedModulePath(require("7zip-bin").path7za);
+}
+
+// Delegates to utils/sevenZipDetect so the import-time lookup and the
+// startup/Settings lookup can never disagree about where 7-Zip lives. This used
+// to be a hardcoded list of six Program Files paths, which missed every
+// non-default install location (the registry knows those) as well as
+// chocolatey/scoop/snap and anything merely on PATH.
+function getCommonSevenZipPaths() {
+  try {
+    return buildSevenZipCandidates();
+  } catch (err) {
+    console.warn("7-Zip candidate lookup failed:", err.message);
+    return [];
+  }
+}
+
+function saveSevenZipPath(sevenZipPath, currentConfig, currentConfigPath) {
+  if (!currentConfigPath) return currentConfig;
+  const newConfig = {
+    ...currentConfig,
+    Library: { ...(currentConfig?.Library || {}), sevenZipPath },
+  };
+  fs.writeFileSync(currentConfigPath, ini.stringify(newConfig));
+  return newConfig;
+}
+
+function getBundledSevenZipPath() {
+  try {
+    const bundledPath = getSevenZipExecutablePath();
+    return bundledPath && fs.existsSync(bundledPath) ? bundledPath : null;
+  } catch (err) {
+    console.warn("Bundled 7-Zip unavailable:", err.message);
+    return null;
+  }
+}
+
+function isExistingFile(filePath) {
+  try {
+    return Boolean(filePath && fs.existsSync(filePath) && fs.statSync(filePath).isFile());
+  } catch {
+    return false;
+  }
+}
+
+function isPathCommand(candidate) {
+  return Boolean(
+    candidate &&
+      !path.isAbsolute(candidate) &&
+      !candidate.includes(path.sep) &&
+      !candidate.includes("/") &&
+      !candidate.includes("\\"),
+  );
+}
+
+function getSevenZipDisplayName(candidate) {
+  return isPathCommand(candidate) ? candidate : path.basename(candidate);
+}
+
+function showOpenDialog(ownerWindow, options) {
+  return ownerWindow
+    ? dialog.showOpenDialog(ownerWindow, options)
+    : dialog.showOpenDialog(options);
+}
+
+function showMessageBox(ownerWindow, options) {
+  return ownerWindow
+    ? dialog.showMessageBox(ownerWindow, options)
+    : dialog.showMessageBox(options);
+}
+
+// Shared with utils/sevenZipDetect so the Settings "Detect" button and this
+// extraction path apply the same runnability test.
+function canSpawnSevenZip(candidate) {
+  return canRunSevenZip(candidate);
+}
+
+async function testSevenZipCandidate(candidate) {
+  const normalized = String(candidate || "").trim();
+  if (!normalized) return false;
+  if (!isPathCommand(normalized) && !isExistingFile(normalized)) return false;
+  return canSpawnSevenZip(normalized);
+}
+
+async function resolveSevenZipExecutablePath({
+  configuredPath,
+  currentConfig,
+  currentConfigPath,
+  ownerWindow,
+  notify,
+  allowManualSelection = true,
+} = {}) {
+  const candidates = [];
+
+  if (configuredPath) {
+    candidates.push({
+      path: configuredPath,
+      source: "configured",
+      message: "Using configured 7-Zip",
+    });
+  }
+
+  for (const candidate of getCommonSevenZipPaths()) {
+    candidates.push({
+      path: candidate,
+      source: "local install",
+      message: "Auto-detected 7-Zip",
+      persist: true,
+    });
+  }
+
+  for (const command of ["7z", "7zz", "7za"]) {
+    candidates.push({
+      path: command,
+      source: "PATH",
+      message: "Using 7-Zip from PATH",
+    });
+  }
+
+  const bundledPath = getBundledSevenZipPath();
+  if (bundledPath) {
+    candidates.push({
+      path: bundledPath,
+      source: "bundled",
+      message: "Using bundled 7-Zip fallback",
+    });
+  }
+
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const candidatePath = String(candidate.path || "").trim();
+    const key = candidatePath.toLowerCase();
+    if (!candidatePath || seen.has(key)) continue;
+    seen.add(key);
+
+    if (await testSevenZipCandidate(candidatePath)) {
+      if (candidate.persist) {
+        saveSevenZipPath(candidatePath, currentConfig, currentConfigPath);
+      }
+      notify?.(`${candidate.message}: ${getSevenZipDisplayName(candidatePath)}`);
+      console.log(`[Importer] ${candidate.message} (${candidate.source}): ${candidatePath}`);
+      return { path: candidatePath, source: candidate.source };
+    }
+
+    if (candidate.source === "configured") {
+      console.warn(`[Importer] Configured 7-Zip is not usable: ${candidatePath}`);
+    }
+  }
+
+  if (!allowManualSelection) return null;
+
+  const result = await showOpenDialog(ownerWindow, {
+    title: "Select 7-Zip executable (7z, 7za, or 7zz)",
+    properties: ["openFile"],
+    filters: [
+      {
+        name: "7-Zip Executable",
+        extensions: process.platform === "win32" ? ["exe"] : ["*"],
+      },
+      { name: "All Files", extensions: ["*"] },
+    ],
+  });
+
+  if (result.canceled || !result.filePaths?.length) return null;
+
+  const selectedPath = result.filePaths[0];
+  if (!(await testSevenZipCandidate(selectedPath))) {
+    await showMessageBox(ownerWindow, {
+      type: "error",
+      title: "Invalid 7-Zip executable",
+      message:
+        "Atlas could not run the selected 7-Zip executable. Please choose a valid 7z, 7za, or 7zz executable.",
+    });
+    console.warn(`[Importer] Selected 7-Zip is not usable: ${selectedPath}`);
+    return null;
+  }
+
+  saveSevenZipPath(selectedPath, currentConfig, currentConfigPath);
+  notify?.(`Using selected 7-Zip: ${getSevenZipDisplayName(selectedPath)}`);
+  console.log(`[Importer] Using selected 7-Zip (manual): ${selectedPath}`);
+  return { path: selectedPath, source: "manual" };
+}
+
+// extractArchiveWithSevenZip() removed: no callers. Superseded by
+// extractArchiveWithFallback(), which is what every import path uses.
+
+
+function createImportCancelledError() {
+  const err = new Error("Import canceled by user");
+  err.code = "IMPORT_CANCELED";
+  return err;
+}
+
+function isImportCancelledError(err) {
+  return err?.code === "IMPORT_CANCELED";
+}
+
+function throwIfImportCanceled(session) {
+  if (session?.cancelRequested) throw createImportCancelledError();
+}
+
+function normalizeForPathCompare(targetPath) {
+  return path.resolve(targetPath).toLowerCase();
+}
+
+function isPathInside(parentPath, childPath) {
+  const parent = normalizeForPathCompare(parentPath);
+  const child = normalizeForPathCompare(childPath);
+  const relative = path.relative(parent, child);
+  return (
+    relative === "" ||
+    (!!relative && !relative.startsWith("..") && !path.isAbsolute(relative))
+  );
+}
+
+// isPathInside() returns TRUE for a path compared against itself, because
+// path.relative() gives "" in that case. That is correct for "is this in my
+// library" questions and catastrophic for "may I delete this" ones -- it is
+// what let the library root pass as a deletable game folder. Deletion checks
+// use this strict variant instead; nothing else should.
+function isStrictlyInsidePath(parentPath, childPath) {
+  const relative = path.relative(
+    normalizeForPathCompare(parentPath),
+    normalizeForPathCompare(childPath),
+  );
+  return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function validateSourceCleanupPath(targetPath, sourceRoot) {
+  const resolvedTarget = path.resolve(targetPath);
+  // A missing source root used to make this function permissive: it fell through
+  // to nothing but a drive-root check. Absence of a root is a caller bug, and
+  // the safe reading of "I don't know what tree this belongs to" is "don't
+  // delete it".
+  if (!sourceRoot) {
+    throw new Error("Refusing to delete without a known source root");
+  }
+  const resolvedSourceRoot = path.resolve(sourceRoot);
+  if (resolvedTarget === path.parse(resolvedTarget).root) {
+    throw new Error("Refusing to delete a drive root");
+  }
+  if (normalizeForPathCompare(resolvedTarget) === normalizeForPathCompare(resolvedSourceRoot)) {
+    throw new Error("Refusing to delete the scan source root");
+  }
+  if (!isStrictlyInsidePath(resolvedSourceRoot, resolvedTarget)) {
+    throw new Error("Refusing to delete outside the scan source root");
+  }
+}
+
+async function removeEmptyParentDirectories(startPath, stopAtPath) {
+  if (!startPath || !stopAtPath) return;
+
+  const resolvedStart = path.resolve(startPath);
+  const startStat = await fs.promises.lstat(resolvedStart).catch(() => null);
+  let current =
+    startStat?.isDirectory() && !startStat.isSymbolicLink()
+      ? resolvedStart
+      : path.dirname(resolvedStart);
+  const stopAt = path.resolve(stopAtPath);
+
+  while (
+    current &&
+    current !== path.parse(current).root &&
+    isPathInside(stopAt, current) &&
+    normalizeForPathCompare(current) !== normalizeForPathCompare(stopAt)
+  ) {
+    const stat = await fs.promises.lstat(current).catch((err) => {
+      console.warn(`Empty parent cleanup stopped; cannot stat ${current}: ${err.message}`);
+      return null;
+    });
+    if (!stat) break;
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      console.warn(`Empty parent cleanup stopped; not a normal directory: ${current}`);
+      break;
+    }
+
+    const entries = await fs.promises.readdir(current).catch((err) => {
+      console.warn(`Empty parent cleanup stopped; cannot read ${current}: ${err.message}`);
+      return null;
+    });
+    if (!entries || entries.length > 0) break;
+
+    try {
+      await fs.promises.rmdir(current);
+      console.log(`Deleted empty parent folder: ${current}`);
+    } catch (err) {
+      console.warn(`Empty parent cleanup stopped; failed to remove ${current}: ${err.message}`);
+      break;
+    }
+    current = path.dirname(current);
+  }
+}
+
+// dedupeDeletionPaths() removed: an unreachable copy of main.js:855, whose only
+// caller here was one of the deleted delete helpers. main.js still uses its own.
+
+
+// deleteLinkedGameFolders / deleteTitleRecord / getTrustedVersion used to sit
+// here as module-level copies of main.js's. They had no callers: every reference
+// inside registerImporterHandlers resolved the ctx-provided originals, which
+// SHADOW a module-level name of the same identifier. Unreachable duplicates that
+// still referenced ctx-only bindings, so they were four latent ReferenceErrors
+// behind code that could never run. Removed rather than repaired.
+
+async function isAllowedDeletionPath(recordId, folderPath, libraryRoot = null) {
+  if (!recordId || !folderPath || typeof folderPath !== "string") return false;
+
+  // Checked BEFORE the recorded-path shortcut below, on purpose. A scan whose
+  // source folder was the library root could record the library root itself as
+  // a version's game_path; once that row existed, the shortcut trusted it
+  // forever and the next replace-version deleted the whole library. A recorded
+  // path is evidence of what Atlas wrote down, not a licence to delete it.
+  const configuredRoot = libraryRoot || getLiveConfig()?.Library?.gameFolder;
+  const resolvedPath = path.resolve(folderPath);
+  if (
+    configuredRoot &&
+    normalizeForPathCompare(resolvedPath) ===
+      normalizeForPathCompare(path.resolve(configuredRoot))
+  ) {
+    console.warn(
+      `Refusing deletion of the configured library root: ${resolvedPath}`,
+    );
+    return false;
+  }
+
+  const knownVersionPaths = await getVersionPathsForRecord(recordId);
+  // THE BUG. This line referenced a ctx-only binding from module scope, so it
+  // threw before reaching the early return below -- which is why the previous
+  // session's note that "isAllowedDeletionPath returns true for any recorded
+  // path before it checks the games folder" was right about the logic and wrong
+  // about the outcome: that return was unreachable.
+  const recentlyDeletedPaths = recentlyDeleted.pathsFor(recordId);
+  if (
+    [...knownVersionPaths, ...recentlyDeletedPaths].some(
+      (knownPath) => normalizeForPathCompare(knownPath) === normalizeForPathCompare(resolvedPath),
+    )
+  ) {
+    return true;
+  }
+
+  // Falls back to the configured library folder when no root is passed. main.js's
+  // copy of this function takes two arguments and reads the config itself; this
+  // one takes an explicit root. Without the fallback, dropping the ctx version
+  // (which used to shadow this one inside the handlers) would have quietly made
+  // the two-argument call sites stricter and broken deletions that used to be
+  // allowed. Same behaviour either way now.
+  return Boolean(
+    configuredRoot &&
+      fs.existsSync(configuredRoot) &&
+      isStrictlyInsidePath(configuredRoot, resolvedPath),
+  );
+}
+
+// containmentRoot is REQUIRED. This helper used to call the delete primitive
+// with no validatePath and no root at all, so any path that reached it was
+// removed recursively with nothing but a drive-root check in the way. Callers
+// now have to say what tree the path is allowed to live in.
+async function removePathIfExists(targetPath, containmentRoot) {
+  if (!targetPath) return;
+  if (!containmentRoot || (Array.isArray(containmentRoot) && containmentRoot.length === 0)) {
+    console.error(
+      `Refusing to remove ${targetPath}: no containment root supplied by caller`,
+    );
+    return;
+  }
+  try {
+    await deletePathWithElevationFallback(targetPath, {
+      recursive: true,
+      force: true,
+      description: "Remove incomplete import files",
+      window: ownerMainWindow,
+      containmentRoot,
+    });
+  } catch (err) {
+    console.error(`Failed to remove incomplete import path ${targetPath}:`, err);
+  }
+}
+
+// Move a directory robustly. On Windows fs.rename frequently fails with EPERM /
+// EBUSY / EACCES even when the destination doesn't exist, because antivirus,
+// Search Indexer, or a lingering file handle is momentarily holding the freshly
+// extracted files. Retry with backoff, then fall back to copy + delete (which
+// also covers cross-volume moves). ENOTEMPTY is handled by the existing
+// getUniquePath check before this is called, but is retried here too for safety.
+async function moveDirWithRetry(src, dest, { attempts = 6, baseDelayMs = 150, containmentRoot = null } = {}) {
+  const retryableCodes = ["EPERM", "EACCES", "EBUSY", "ENOTEMPTY", "EEXIST"];
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await fsp.rename(src, dest);
+      return;
+    } catch (err) {
+      const isRetryable = retryableCodes.includes(err.code) || err.code === "EXDEV";
+      const lastAttempt = attempt === attempts;
+      if (!isRetryable) throw err;
+      if (lastAttempt || err.code === "EXDEV") {
+        // Final fallback (or cross-device): copy then remove the source. cp with
+        // force overwrites anything a partially-failed rename may have created.
+        await fsp.cp(src, dest, { recursive: true, force: true });
+        await removePathIfExists(src, containmentRoot || path.dirname(path.resolve(src)));
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * attempt));
+    }
+  }
+}
+
+async function replaceInstalledVersionAfterImport({
+  recordId,
+  newVersion,
+  newGamePath,
+  replaceVersion,
+  replaceVersionId,
+  oldVersionSnapshot = null,
+  trustedOldPath = null,
+  deleteDatabaseRow = true,
+  libraryRoot = null,
+  auditDataDir = null,
+  sender = ownerMainWindow,
+}) {
+  const selectedReplaceVersion = String(replaceVersion || "").trim();
+  if (!recordId || !selectedReplaceVersion) return { replaced: false };
+  const audit = (stage, details = {}) => {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      stage,
+      recordId,
+      replaceVersion: selectedReplaceVersion,
+      replaceVersionId: replaceVersionId || null,
+      newVersion: String(newVersion || ""),
+      newGamePath: newGamePath || "",
+      ...details,
+    };
+    console.log("[ReplacementAudit]", JSON.stringify(entry));
+    try {
+      fs.appendFileSync(
+        path.join(auditDataDir || process.cwd(), "replacement-audit.jsonl"),
+        `${JSON.stringify(entry)}\n`,
+        "utf8",
+      );
+    } catch (auditErr) {
+      console.warn("Failed to write replacement audit:", auditErr.message);
+    }
+  };
+  audit("start");
+
+  const normalizedNewVersion = String(newVersion || "").trim().toLowerCase();
+  const normalizedReplaceVersion = selectedReplaceVersion.toLowerCase();
+
+  if (normalizedNewVersion && normalizedNewVersion === normalizedReplaceVersion) {
+    audit("skipped-same-version-label");
+    return {
+      replaced: false,
+      skipped: true,
+      reason: "Replacement version matches the newly imported version",
+    };
+  }
+
+  const selectedVersionId = Number.parseInt(replaceVersionId, 10);
+  const oldVersion = oldVersionSnapshot || (Number.isInteger(selectedVersionId) && selectedVersionId > 0
+    ? await dbGet(
+        dbModule.db,
+        `SELECT rowid AS version_id, version, game_path, exec_path
+         FROM versions WHERE rowid = ? AND record_id = ? LIMIT 1`,
+        [selectedVersionId, recordId],
+      )
+    : await getVersionForRecord(recordId, selectedReplaceVersion));
+  if (!oldVersion) {
+    audit("selected-version-not-found");
+    return {
+      replaced: false,
+      skipped: true,
+      reason: "Replacement version was not found",
+    };
+  }
+
+  const oldPath = oldVersion.game_path;
+  audit("selected-version-resolved", {
+    resolvedVersionId: oldVersion.version_id || null,
+    resolvedVersion: oldVersion.version || "",
+    oldPath: oldPath || "",
+  });
+  if (!oldPath) {
+    if (oldVersion.version_id) {
+      await dbRun(dbModule.db, `DELETE FROM versions WHERE rowid = ? AND record_id = ?`, [oldVersion.version_id, recordId]);
+    } else {
+      await deleteVersion(recordId, selectedReplaceVersion);
+    }
+    return { replaced: true, deletedFiles: false };
+  }
+
+  const resolvedOldPath = path.resolve(oldPath);
+  const resolvedNewPath = newGamePath ? path.resolve(newGamePath) : "";
+
+  if (
+    resolvedNewPath &&
+    normalizeForPathCompare(resolvedOldPath) ===
+      normalizeForPathCompare(resolvedNewPath)
+  ) {
+    return {
+      replaced: false,
+      skipped: true,
+      reason: `Replacement path matches the newly imported path: ${resolvedOldPath}`,
+    };
+  }
+
+  const hadOldFiles = fs.existsSync(resolvedOldPath);
+  const oldPathAllowed = trustedOldPath === null
+    ? await isAllowedDeletionPath(recordId, resolvedOldPath, libraryRoot)
+    : trustedOldPath === true;
+  audit("path-check", {
+    resolvedOldPath,
+    resolvedNewPath,
+    hadOldFiles,
+    allowedDeletionPath: hadOldFiles ? oldPathAllowed : null,
+    trustCapturedBeforeVersionUpdate: trustedOldPath !== null,
+  });
+  // Declared out here, NOT inside `if (hadOldFiles)`. The save-restore step
+  // further down runs after that block closes, so a block-scoped `let` here is
+  // invisible to it and reading it throws ReferenceError on every call --
+  // including the happy path -- which meant saves were backed up and then
+  // silently never restored. Keep this at function scope.
+  let saveBackup = null;
+  if (hadOldFiles) {
+    if (!oldPathAllowed) {
+      return {
+        replaced: false,
+        skipped: true,
+        reason: `Replacement path is not allowed for deletion: ${resolvedOldPath}`,
+      };
+    }
+
+    const parsedPath = path.parse(resolvedOldPath);
+    if (resolvedOldPath === parsedPath.root) {
+      return {
+        replaced: false,
+        skipped: true,
+        reason: `Refusing to delete a drive root: ${resolvedOldPath}`,
+      };
+    }
+
+    const stat = await fs.promises.stat(resolvedOldPath);
+    if (!stat.isDirectory()) {
+      return {
+        replaced: false,
+        skipped: true,
+        reason: `Replacement path is not a directory: ${resolvedOldPath}`,
+      };
+    }
+
+    try {
+      saveBackup = await backupSaveArtifacts({
+        oldGamePath: resolvedOldPath,
+        recordId,
+        appDataDir: auditDataDir || process.cwd(),
+      });
+      audit("save-backup-result", {
+        success: Boolean(saveBackup?.success),
+        artifactCount: saveBackup?.artifacts?.length || 0,
+        backupDir: saveBackup?.backupDir || null,
+      });
+    } catch (saveErr) {
+      console.warn("Failed to backup save artifacts:", saveErr.message);
+      audit("save-backup-failed", { error: saveErr.message });
+    }
+
+    try {
+      const deleteResult = await deletePathWithElevationFallback(resolvedOldPath, {
+        recursive: true,
+        force: true,
+        description: `Delete old version ${selectedReplaceVersion}`,
+        window: sender,
+        containmentRoot: libraryRoot,
+        validatePath: async (candidatePath) => {
+          if (candidatePath === path.parse(candidatePath).root) {
+            throw new Error("Refusing to delete a drive root");
+          }
+          if (
+            libraryRoot &&
+            normalizeForPathCompare(candidatePath) ===
+              normalizeForPathCompare(path.resolve(libraryRoot))
+          ) {
+            throw new Error("Refusing to delete the library root");
+          }
+          if (normalizeForPathCompare(candidatePath) !== normalizeForPathCompare(resolvedOldPath)) {
+            throw new Error("Replacement delete target changed");
+          }
+          if (!oldPathAllowed) {
+            throw new Error("Replacement path was not trusted before the version update");
+          }
+        },
+        onProgress: (text) => {
+          sender?.webContents?.send("import-progress", {
+            text,
+            progress: 0,
+            total: 0,
+            canCancel: true,
+          });
+        },
+      });
+      audit("file-delete-result", {
+        resolvedOldPath,
+        deleteResult,
+        existsAfterDelete: fs.existsSync(resolvedOldPath),
+      });
+      if (!deleteResult.success) {
+        return {
+          replaced: false,
+          skipped: true,
+          reason: deleteResult.canceled
+            ? "Administrator delete was canceled"
+            : deleteResult.error || `Failed to delete replacement files: ${resolvedOldPath}`,
+        };
+      }
+      await removeEmptyParentDirectories(
+        resolvedOldPath,
+        libraryRoot,
+      );
+    } catch (err) {
+      return {
+        replaced: false,
+        skipped: true,
+          reason: `Failed to delete replacement files at ${resolvedOldPath}: ${err.message}`,
+      };
+    }
+  }
+
+  // Restore save artifacts into resolvedNewPath
+  if (saveBackup && saveBackup.success && saveBackup.artifacts?.length > 0 && resolvedNewPath && fs.existsSync(resolvedNewPath)) {
+    try {
+      const restoreResult = await restoreSaveArtifacts({
+        backupManifest: saveBackup,
+        newGamePath: resolvedNewPath,
+      });
+      audit("save-restore-result", restoreResult);
+    } catch (restoreErr) {
+      console.warn("Failed to restore save artifacts:", restoreErr.message);
+      audit("save-restore-failed", { error: restoreErr.message });
+    }
+  }
+
+  // Folder Name Cleanup (e.g. ExampleGame (1) -> ExampleGame)
+  let finalNewGamePath = resolvedNewPath;
+  if (
+    resolvedOldPath &&
+    resolvedNewPath &&
+    !fs.existsSync(resolvedOldPath) &&
+    fs.existsSync(resolvedNewPath)
+  ) {
+    const newBase = path.basename(resolvedNewPath);
+    if (/\s*\(\d+\)$/.test(newBase)) {
+      try {
+        await fs.promises.rename(resolvedNewPath, resolvedOldPath);
+        finalNewGamePath = resolvedOldPath;
+        audit("folder-renamed", { from: resolvedNewPath, to: finalNewGamePath });
+
+        if (recordId && newVersion) {
+          const newVerRow = await dbGet(
+            dbModule.db,
+            `SELECT rowid AS version_id, game_path, exec_path FROM versions WHERE record_id = ? AND version = ? LIMIT 1`,
+            [recordId, newVersion]
+          );
+          if (newVerRow && newVerRow.game_path) {
+            const relExec = newVerRow.exec_path ? path.relative(newVerRow.game_path, newVerRow.exec_path) : "";
+            const newExecPath = relExec ? path.join(finalNewGamePath, relExec) : newVerRow.exec_path;
+            await dbRun(
+              dbModule.db,
+              `UPDATE versions SET game_path = ?, exec_path = ? WHERE rowid = ?`,
+              [finalNewGamePath, newExecPath, newVerRow.version_id]
+            );
+          }
+        }
+      } catch (renameErr) {
+        console.warn("Failed to rename update folder to original clean name:", renameErr.message);
+        audit("folder-rename-failed", { error: renameErr.message });
+      }
+    }
+  }
+
+  if (deleteDatabaseRow && oldVersion.version_id) {
+    const deleteRowResult = await dbRun(dbModule.db, `DELETE FROM versions WHERE rowid = ? AND record_id = ?`, [oldVersion.version_id, recordId]);
+    audit("database-delete-result", {
+      resolvedVersionId: oldVersion.version_id,
+      changes: deleteRowResult?.changes ?? null,
+    });
+  } else if (deleteDatabaseRow) {
+    const deleteRowResult = await deleteVersion(recordId, selectedReplaceVersion);
+    audit("database-delete-result", {
+      resolvedVersionId: null,
+      changes: deleteRowResult?.changes ?? null,
+    });
+  }
+
+  sender?.webContents?.send("import-progress", {
+    text: `Replaced old version ${selectedReplaceVersion}`,
+    progress: 0,
+    total: 0,
+    canCancel: true,
+  });
+
+  audit("complete", { deletedFiles: hadOldFiles, databaseRowUpdatedInPlace: !deleteDatabaseRow, newGamePath: finalNewGamePath });
+  return { replaced: true, deletedFiles: hadOldFiles, newGamePath: finalNewGamePath };
+}
+
+
+
+const normalizeImportMatchState = (game = {}) => {
+  const results = Array.isArray(game.results) ? game.results : [];
+  if (results.length === 1 && results[0]?.key === "match") {
+    return { ...game, results, resultSelectedValue: "match", resultVisibility: "visible" };
+  }
+  if (results.length > 1) {
+    const selectedValue = results.some((result) => result.key === game.resultSelectedValue)
+      ? game.resultSelectedValue
+      : results[0]?.key || "";
+    return { ...game, results, resultSelectedValue: selectedValue, resultVisibility: "visible" };
+  }
+  return { ...game, results: [], resultSelectedValue: "", resultVisibility: "hidden" };
+};
+
+const normalizeF95IdInput = (value) => {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const threadMatch = raw.match(/f95zone\.to\/threads\/(?:[^/?#]*\.)?(\d+)(?:[/?#]|$)/i);
+  if (threadMatch) return threadMatch[1];
+  const prefixedMatch = raw.match(/\bf95[\s_-]*(\d+)\b/i);
+  if (prefixedMatch) return prefixedMatch[1];
+  return /^\d+$/.test(raw) ? raw : "";
+};
+
+const normalizeLewdCornerIdInput = (value) => {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const prefixedMatch = raw.match(/\b(?:lc|lewdcorner|lewd\s*corner)[\s_-]*(\d+)\b/i);
+  if (prefixedMatch) return prefixedMatch[1];
+  const parsedUrlId = parseLewdCornerIdFromUrl(raw);
+  if (parsedUrlId) return String(parsedUrlId);
+  return /^\d+$/.test(raw) && Number(raw) > 0 ? raw : "";
+};
+
+const hydrateImportMatch = async (game, selectedValue) => {
+  let updatedGame = normalizeImportMatchState({ ...game, resultSelectedValue: selectedValue });
+  const selected = game.results?.find((result) => result.key === selectedValue);
+
+  if (selected && selectedValue !== "match") {
+    const parts = String(selected.value || "").split(" | ");
+    updatedGame = {
+      ...updatedGame,
+      atlasId: selected.atlasId || parts[0],
+      f95Id: selected.f95Id || parts[1] || updatedGame.f95Id || "",
+      lcId: selected.lcId || updatedGame.lcId || updatedGame.lewdCornerId || "",
+      lewdCornerId: selected.lcId || updatedGame.lewdCornerId || updatedGame.lcId || "",
+      lewdCornerSiteUrl: selected.lewdCornerSiteUrl || updatedGame.lewdCornerSiteUrl || "",
+      title: selected.title || parts[2],
+      creator: selected.creator || parts[3],
+      engine: selected.engine || updatedGame.engine,
+      latestVersion: selected.latestVersion || updatedGame.latestVersion || "",
+    };
+    const atlasData = await getAtlasData(updatedGame.atlasId);
+    updatedGame = {
+      ...updatedGame,
+      engine: atlasData.engine || updatedGame.engine || "Unknown",
+      f95Id: atlasData.f95_id || updatedGame.f95Id || "",
+      siteUrl: atlasData.siteUrl || atlasData.site_url || updatedGame.siteUrl || "",
+      latestVersion: atlasData.latestVersion || "",
+    };
+  }
+
+  const status = await getImportRecordStatus(updatedGame);
+  const recordExist = status?.status === "alreadyImported";
+  const isSteamVersion = status?.status === "steamVersion";
+  const isLewdCornerVersion = status?.status === "lewdCornerVersion";
+  return normalizeImportMatchState({
+    ...updatedGame,
+    recordExist,
+    existingRecordId: status?.recordId || "",
+    scanStatus: recordExist
+      ? "alreadyImported"
+      : isSteamVersion
+        ? "steamVersion"
+        : isLewdCornerVersion
+          ? "lewdCornerVersion"
+          : status?.status === "repairPath"
+            ? "repairPath"
+            : "new",
+    scanMessage: recordExist
+      ? "Already imported"
+      : isSteamVersion
+        ? "Add as Steam version"
+        : isLewdCornerVersion
+          ? "Add as LewdCorner version"
+          : status?.status === "repairPath"
+            ? "Repair path"
+            : updatedGame.isArchive
+              ? "Archive"
+              : "Ready to import",
+  });
+};
+
+const chooseInstalledImportMatch = async (game, results) => {
+  const baseGame = normalizeImportMatchState({ ...game, results });
+  for (const result of results) {
+    const candidate = await hydrateImportMatch(baseGame, result.key);
+    if (["alreadyImported", "repairPath", "steamVersion", "lewdCornerVersion"].includes(candidate.scanStatus)) {
+      return candidate;
+    }
+  }
+  return hydrateImportMatch(baseGame, baseGame.resultSelectedValue || results[0]?.key || "");
+};
+
+const buildImportMatchResult = (match) => ({
+  key: String(match.atlas_id || match.atlasId || ""),
+  value: `${match.atlas_id || match.atlasId || ""} | ${match.f95_id || match.f95Id || ""} | ${match.title || ""} | ${match.creator || ""}`,
+  atlasId: String(match.atlas_id || match.atlasId || ""),
+  f95Id: match.f95_id || match.f95Id || "",
+  lcId: match.lc_id || match.lcId || match.lewdCornerId || "",
+  lewdCornerSiteUrl: match.lewdCornerSiteUrl || match.lewdcornerSiteUrl || "",
+  title: match.title || "",
+  creator: match.creator || "",
+  engine: match.engine || "",
+  latestVersion: match.latestVersion || "",
+});
+
+const applyImportMatchData = (game, match, { f95Id = "", lcId = "" } = {}) => ({
+  ...game,
+  atlasId: String(match.atlas_id || match.atlasId || ""),
+  f95Id: match.f95_id || match.f95Id || f95Id || game.f95Id || "",
+  lcId: match.lc_id || match.lcId || match.lewdCornerId || lcId || game.lcId || game.lewdCornerId || "",
+  lewdCornerId: match.lc_id || match.lcId || match.lewdCornerId || lcId || game.lewdCornerId || game.lcId || "",
+  lewdCornerSiteUrl: match.lewdCornerSiteUrl || match.lewdcornerSiteUrl || game.lewdCornerSiteUrl || "",
+  siteUrl: match.siteUrl || match.site_url || game.siteUrl || "",
+  title: match.title || game.title,
+  creator: match.creator || game.creator,
+  engine: match.engine || game.engine || "Unknown",
+  latestVersion: match.latestVersion || game.latestVersion || "",
+});
+
+// ── IPC Handlers ───────────────────────────────────────────────────
+
+module.exports = function registerImporterHandlers(ctx) {
+  handlerCtx = ctx;
+  const {
+    mainWindow, importerWindow, appConfig, configPath, dataDir,
+    searchAtlas, searchAtlasByF95Id, findF95Id, getAtlasData,
+    addAtlasMapping, GetAtlasIDbyRecord, checkPathExist, findExistingRecordForImport,
+    getImportRecordStatus, checkRecordExist, addGame, addVersion,
+    upsertVersion, updateVersion, updateGame, updateFolderSize, getSteamIDbyRecord,
+    addSteamMapping, getBannerUrl, getScreensUrlList,
+    updateBanners, updatePreviews,
+    getRemoteBannerUrl, getRemotePreviewUrls,
+    getAllDownloadableAssetUrlsForRecord, upsertMediaAsset,
+    getVersionForRecord, getVersionPathsForRecord,
+    deleteVersion, deleteGameCompletely, deleteTitleRecord,
+    getTrustedVersion, isAllowedDeletionPath, isPathInside,
+    normalizeForPathCompare, removeEmptyParentDirectories,
+    showExecutableChooser,
+    startSteamScan, startScan, getAssetBasePath, getMediaStorageMode,
+    getMetadataSourceOrder,
+    db,
+  } = ctx
+  ownerMainWindow = mainWindow
+
+  // Database access for library/catalogRecord.js, injected rather than imported
+  // so the resolution order can be asserted in tests without sqlite. Read
+  // through dbModule at CALL time: db/index exposes `db` as a getter populated
+  // after initializeDatabase(), so a value captured at registration can be null.
+  const buildCatalogRecordDeps = () => ({
+    dbGet: (sql, params) => dbGet(dbModule.db || db, sql, params),
+    dbRun: (sql, params) => dbRun(dbModule.db || db, sql, params),
+    addGame,
+    updateGame,
+    addAtlasMapping,
+    addLewdCornerMapping,
+    addSteamMapping,
+    addGogMapping,
+    findRecordByLewdCornerId,
+    findRecordBySteamId,
+    findRecordByGogId,
+  })
+
+  // ── Phase 3: import owned Steam games (incl. not installed) ────────────────
+  //
+  // Creates a metadata-only library record for an owned Steam game the user
+  // hasn't installed. Reuses the existing Steam Store metadata pipeline
+  // (fetchAndStoreSteamData) and the same games/steam_mappings/versions helpers
+  // the installed-scan uses. The key difference: the version row is written with
+  // an empty game_path, which the version reader already maps to
+  // isInstalled:false / installState:"missing" — so the record shows up as
+  // not-installed everywhere and the detail page's Steam INSTALL button targets
+  // it. Installing later (via steam://install) fills in the real path on rescan.
+  //
+  // Idempotent: if a record already owns this appid, we return it untouched
+  // rather than duplicating.
+  const importOwnedSteamGame = async (appid, name, installDir = '', assetSourceOrder = null) => {
+    const steamId = String(appid || '').trim()
+    if (!/^\d+$/.test(steamId)) {
+      return { ok: false, appid, error: 'Invalid Steam appid.' }
+    }
+    const dir = String(installDir || '').trim()
+
+    // Pull Store metadata + art FIRST. This also (re)writes steam_data for this
+    // appid including its server-provided atlas_id, which the record resolution
+    // below relies on to group seasons: several Steam appids can map to one
+    // atlas_id, and we want the new appid to attach to whichever record already
+    // represents that atlas rather than spawning a duplicate tile. Non-fatal if
+    // it fails — we can still create a minimal record from the owned-games name.
+    // assetSourceOrder, when provided, overrides the configured default (used by
+    // the UI's "retry with CDN" fallback after a GetItems rate-limit).
+    let meta = null
+    try {
+      meta = await fetchAndStoreSteamData(
+        db,
+        steamId,
+        assetSourceOrder || ctx.appConfig?.Metadata?.steamAssetSourceOrder,
+      )
+    } catch (err) {
+      console.warn(`Phase3: metadata fetch failed for ${steamId}:`, err.message)
+    }
+
+    // Resolve the target record AFTER metadata is stored, so atlas grouping can
+    // see this appid's atlas_id. findRecordBySteamId matches, in order: an
+    // existing steam_mapping for this appid, an atlas/f95 record listing it in
+    // external_ids, or any record already mapped to this appid's atlas_id.
+    const existing = await findRecordBySteamId(steamId)
+
+    // Independently resolve which ATLAS this appid belongs to (via
+    // atlas_data.external_ids / steam_appids[]). This is what lets a first-time
+    // import attach to the right catalog game and use the atlas's canonical
+    // title, instead of creating a standalone record from the Steam title that
+    // then has to be mapped by hand.
+    const atlasMatch = await findAtlasBySteamId(steamId)
+
+    // Title preference: the atlas canonical title (so all seasons share one
+    // tile named like the catalog) > the Steam store title > the owned-games
+    // name > a last-resort placeholder.
+    const title = String(
+      (atlasMatch && atlasMatch.title) || meta?.title || name || `Steam App ${steamId}`
+    ).trim()
+    const creator = String(meta?.developer || 'Unknown').trim()
+    const engine = String(meta?.engine || '').trim()
+
+    // Reuse the resolved record if we have one, else create it. addGame also
+    // dedups by title/creator.
+    const recordId = existing || (await addGame({ title, creator, engine }))
+
+    // Map the record to the atlas so it groups with any other seasons and pulls
+    // atlas metadata. Safe/idempotent: only maps when we found an atlas and the
+    // record isn't already mapped to one.
+    if (atlasMatch && atlasMatch.atlasId != null) {
+      try {
+        const currentAtlas = await GetAtlasIDbyRecord(recordId)
+        if (!currentAtlas) {
+          await addAtlasMapping(recordId, atlasMatch.atlasId)
+        }
+      } catch (mapErr) {
+        console.warn(`Phase3: atlas mapping failed for record ${recordId} -> atlas ${atlasMatch.atlasId}:`, mapErr.message)
+      }
+    }
+
+    // steam_mappings.record_id is the PRIMARY KEY, so a record can hold only one
+    // title-level appid. Per the season design, versions.source_app_id is the
+    // source of truth for per-version identity; steam_mappings is kept only as a
+    // legacy title-level pointer. Set it only when the record has none yet (the
+    // first appid wins and stays), so adding Season 2 doesn't repoint the tile.
+    const hasMapping = await recordHasSteamMapping(recordId)
+    if (!hasMapping) {
+      await addSteamMapping(recordId, steamId)
+    }
+
+    // Version label = this appid's own Steam title (e.g. "Lust Theory Season 2"),
+    // so each season is a distinct, human-named version under the shared atlas
+    // tile — even though the record/tile itself is named with the atlas title.
+    // Falls back to the atlas/record title only if Steam gave us nothing.
+    const seasonTitle = String(meta?.title || name || `Steam App ${steamId}`).trim()
+    const versionLabel = await uniqueSteamVersionLabel(recordId, seasonTitle, steamId)
+
+    // Version path: if the game is locally installed, use its real Steam install
+    // directory (…/steamapps/common/<game>) so the version reader recognizes it
+    // as installed and it shows in the banner/library view + launches via
+    // steam://run. If not installed, keep the path empty — the record then reads
+    // as not-installed and appears under the All/Uninstalled install-state
+    // filter. upsertVersion (keyed on record_id + version) updates the same
+    // version in place on re-add rather than duplicating.
+    await upsertVersion({ version: versionLabel, folder: dir, execPath: '', folderSize: 0, source: 'steam', sourceAppId: steamId }, recordId)
+
+    return {
+      ok: true,
+      appid: steamId,
+      recordId,
+      title,
+      versionLabel,
+      rateLimited: meta?.__rateLimited === true,
+      installed: Boolean(dir),
+      alreadyPresent: Boolean(existing),
+    }
+  }
+
+  // ── Manual add & catalog search ───────────────────────────────────────────
+  //
+  // Motivation: Steam's GetOwnedGames does not return every app in a user's
+  // library. Free titles in particular are omitted, and no combination of
+  // include_played_free_games / include_free_sub / skip_unvetted_apps changes
+  // that (verified against a real account: identical count for all eight
+  // permutations). reconcileInstalled() now unions in installed games found via
+  // appmanifest scan, but an UNINSTALLED title Steam refuses to list has no
+  // local footprint at all and is unreachable by any automatic path.
+  //
+  // So: let the user search the storefronts directly and add by id, pulling real
+  // metadata and art so nothing has to be typed in by hand.
+
+  // A unix timestamp for an adult date of birth. Without it Steam's storefront
+  // omits mature-gated titles from search results entirely — which are exactly
+  // the ones most likely to be missing from the owned list.
+  const STORE_AGE_GATE_COOKIE = 'birthtime=568022401; mature_content=1; wants_mature_content=1'
+
+  const searchSteamStore = async (term) => {
+    const url = `https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(term)}&l=english&cc=us`
+    const res = await fetch(url, { headers: { Cookie: STORE_AGE_GATE_COOKIE } })
+    if (!res.ok) throw new Error(`Steam search returned HTTP ${res.status}`)
+    const json = await res.json()
+    const items = Array.isArray(json?.items) ? json.items : []
+    return items.map((item) => ({
+      source: 'steam',
+      id: String(item.id),
+      name: item.name || `App ${item.id}`,
+      // tiny_image is a small capsule; good enough for a result row and cheap.
+      imageUrl: item.tiny_image || null,
+      isFree: item.price ? item.price.final === 0 : null,
+      type: item.type || '',
+    }))
+  }
+
+  const searchGogCatalog = async (term) => {
+    // embed.gog.com's filtered endpoint is used rather than catalog.gog.com
+    // because it needs no auth and returns the numeric product id directly,
+    // which is what gog_mappings keys on.
+    const url = `https://embed.gog.com/games/ajax/filtered?mediaType=game&search=${encodeURIComponent(term)}`
+    const res = await fetch(url)
+    if (!res.ok) throw new Error(`GOG search returned HTTP ${res.status}`)
+    const json = await res.json()
+    const products = Array.isArray(json?.products) ? json.products : []
+    return products.map((product) => ({
+      source: 'gog',
+      id: String(product.id),
+      name: product.title || `Product ${product.id}`,
+      // GOG returns protocol-relative image paths with no extension.
+      imageUrl: product.image ? `https:${product.image}_196.jpg` : null,
+      isFree: product.price ? product.price.isFree === true : null,
+      type: product.isGame === false ? 'dlc' : 'game',
+    }))
+  }
+
+  ipcMain.handle('catalog-search', async (event, { source = 'steam', query = '' } = {}) => {
+    const term = String(query || '').trim()
+    if (term.length < 2) {
+      return { ok: false, results: [], error: 'Enter at least two characters to search.' }
+    }
+    try {
+      const results = source === 'gog'
+        ? await searchGogCatalog(term)
+        : await searchSteamStore(term)
+      return { ok: true, results }
+    } catch (err) {
+      console.error(`catalog-search (${source}) failed:`, err)
+      return { ok: false, results: [], error: err.message || 'Search failed.' }
+    }
+  })
+
+  // GOG twin of importOwnedSteamGame. Same shape, same ordering: fetch and store
+  // metadata FIRST (so record resolution can see the product's atlas_id and group
+  // with any existing record for the same game), then resolve or create the
+  // record, map it, and upsert a version.
+  const importGogGameById = async (gogId, fallbackName = '', installDir = '') => {
+    const id = String(gogId || '').trim()
+    if (!/^\d+$/.test(id)) {
+      return { ok: false, gogId, error: 'Invalid GOG product id.' }
+    }
+    const dir = String(installDir || '').trim()
+
+    let meta = null
+    try {
+      meta = await fetchAndStoreGogData(db, parseInt(id, 10))
+    } catch (err) {
+      console.warn(`Manual add: GOG metadata fetch failed for ${id}:`, err.message)
+    }
+
+    const existing = await findRecordByGogId(parseInt(id, 10))
+    const title = String(meta?.title || fallbackName || `GOG Product ${id}`).trim()
+    const creator = String(meta?.developer || 'Unknown').trim()
+    const engine = String(meta?.engine || '').trim()
+
+    const recordId = existing || (await addGame({ title, creator, engine }))
+    if (!existing) await addGogMapping(recordId, parseInt(id, 10))
+
+    await upsertVersion(
+      { version: title, folder: dir, execPath: '', folderSize: 0, source: 'gog', sourceAppId: id },
+      recordId,
+    )
+
+    return {
+      ok: true,
+      gogId: id,
+      recordId,
+      title,
+      versionLabel: title,
+      installed: Boolean(dir),
+      alreadyPresent: Boolean(existing),
+    }
+  }
+
+  // Unified manual add. Dispatches on source so the renderer has one call for
+  // both storefronts, and reuses the existing Steam path verbatim rather than
+  // duplicating its atlas-grouping logic.
+  ipcMain.handle('manual-add-game', async (event, { source = 'steam', id, name = '', installDir = '' } = {}) => {
+    try {
+      const result = source === 'gog'
+        ? await importGogGameById(id, name, installDir)
+        : await importOwnedSteamGame(id, name, installDir, null)
+      if (result?.ok) {
+        BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed()) win.webContents.send('import-complete')
+        })
+      }
+      return result
+    } catch (err) {
+      console.error('manual-add-game error:', err)
+      return { ok: false, id, error: err.message || 'Could not add game.' }
+    }
+  })
+
+  // Folder picker for the optional local path on a manually added game.
+  ipcMain.handle('manual-add-pick-folder', async (event) => {
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    const result = await dialog.showOpenDialog(owner, {
+      title: 'Select the game folder',
+      properties: ['openDirectory'],
+    })
+    if (result.canceled || !result.filePaths?.length) return { ok: false, canceled: true }
+    return { ok: true, path: result.filePaths[0] }
+  })
+
+  // Single add.
+  ipcMain.handle('steam-add-owned-game', async (event, { appid, name, installDir, assetSourceOrder } = {}) => {
+    try {
+      const result = await importOwnedSteamGame(appid, name, installDir, assetSourceOrder)
+      // Tell every window to refresh its library so the new/updated record shows
+      // up immediately (reuses the same signal a normal import emits).
+      if (result?.ok) {
+        BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed()) win.webContents.send('import-complete')
+        })
+      }
+      return result
+    } catch (err) {
+      console.error('steam-add-owned-game error:', err)
+      return { ok: false, appid, error: err.message || 'Could not add game.' }
+    }
+  })
+
+  // Which of the given appids already have an actual Steam VERSION in Atlas.
+  // Keyed on a steam-tagged version (source='steam' + matching appid), not just
+  // a title-level mapping or a cross-source external_id — so an F95 title that
+  // merely references the appid still shows as needing its Steam version added.
+  ipcMain.handle('steam-owned-existing', async (event, { appids = [] } = {}) => {
+    const present = []
+    try {
+      for (const appid of Array.isArray(appids) ? appids : []) {
+        const id = String(appid)
+        const row = await dbGet(
+          db,
+          `SELECT 1 FROM versions WHERE source = 'steam' AND source_app_id = ? LIMIT 1`,
+          [id],
+        )
+        if (row) present.push(id)
+      }
+      return { ok: true, present }
+    } catch (err) {
+      console.error('steam-owned-existing error:', err)
+      return { ok: false, present: [], error: err.message }
+    }
+  })
+
+  // Detail-page install poll. Given a record_id (or appid), check whether its
+  // Steam game is now installed on disk. If it just became installed, heal the
+  // version path so the record reads as installed, and return the refreshed
+  // game. Cheap enough to call on a timer. Returns:
+  //   { ok, installed, changed, game? }
+  ipcMain.handle('steam-check-installed', async (event, { recordId, appid, version } = {}) => {
+    try {
+      let steamId = String(appid || '').trim()
+      if (!steamId && recordId != null) {
+        steamId = String((await getSteamIDbyRecord(recordId)) || '').trim()
+      }
+      if (!/^\d+$/.test(steamId)) {
+        return { ok: false, installed: false, changed: false, error: 'No Steam appid for this game.' }
+      }
+
+      const { installed, installDir } = await isSteamAppInstalled(steamId)
+
+      // Resolve the record if we only got an appid.
+      let rid = recordId
+      if (rid == null) rid = await findRecordBySteamId(steamId)
+
+      let changed = false
+      let game = null
+      if (rid != null) {
+        // Read current install state from the DB record.
+        const current = await getGame(rid, getAssetBasePath(), process.defaultApp, getMediaStorageMode()).catch(() => null)
+        const wasInstalled = current?.hasInstalledVersion === true
+        if (installed && !wasInstalled) {
+          // Heal the specific Steam version (by name when known, else 'Steam'),
+          // keeping its source tag so it stays identifiable.
+          await upsertVersion(
+            { version: version || 'Steam', folder: installDir || '', execPath: '', folderSize: 0, source: 'steam', sourceAppId: steamId },
+            rid,
+          )
+          changed = true
+          // Notify all windows so the library refreshes too.
+          BrowserWindow.getAllWindows().forEach((win) => {
+            if (!win.isDestroyed()) win.webContents.send('import-complete')
+          })
+        }
+        game = await getGame(rid, getAssetBasePath(), process.defaultApp, getMediaStorageMode()).catch(() => null)
+      }
+
+      return { ok: true, installed, changed, game }
+    } catch (err) {
+      console.error('steam-check-installed error:', err)
+      return { ok: false, installed: false, changed: false, error: err.message }
+    }
+  })
+
+  // Bulk add. `games` is [{ appid, name }]. Runs sequentially to stay gentle on
+  // the Steam Store API (which rate-limits) and emits progress to the importer
+  // window. Returns a per-game summary.
+  ipcMain.handle('steam-add-owned-bulk', async (event, { games = [], assetSourceOrder = null } = {}) => {
+    const ownerWindow = BrowserWindow.fromWebContents(event.sender)
+    const list = Array.isArray(games) ? games : []
+    const results = { added: 0, skipped: 0, failed: 0, total: list.length, errors: [], rateLimited: false, processed: 0 }
+
+    const emit = (text, done) => {
+      ownerWindow?.webContents?.send('steam-bulk-progress', {
+        text,
+        done,
+        total: list.length,
+      })
+    }
+
+    for (let i = 0; i < list.length; i++) {
+      const g = list[i]
+      emit(`Adding ${g?.name || g?.appid} (${i + 1}/${list.length})`, i)
+      try {
+        const r = await importOwnedSteamGame(g?.appid, g?.name, g?.installDir, assetSourceOrder)
+        if (r.ok && r.alreadyPresent) results.skipped++
+        else if (r.ok) results.added++
+        else {
+          results.failed++
+          results.errors.push({ appid: g?.appid, error: r.error })
+        }
+        // If Steam started rate-limiting the image API, stop early rather than
+        // hammering it — the records added past this point would get poor art
+        // anyway. Report it so the UI can offer a fallback source.
+        if (r.rateLimited) {
+          results.rateLimited = true
+          results.processed = i + 1
+          emit(`Stopped: Steam rate-limited image requests`, i + 1)
+          break
+        }
+      } catch (err) {
+        results.failed++
+        results.errors.push({ appid: g?.appid, error: err.message })
+      }
+      results.processed = i + 1
+      // Small courtesy delay between Store API hits.
+      await new Promise((res) => setTimeout(res, 250))
+    }
+
+    if (!results.rateLimited) emit('Done', list.length)
+    // Refresh every window's library once the batch finishes.
+    if (results.added > 0 || results.skipped > 0) {
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) win.webContents.send('import-complete')
+      })
+    }
+    return { ok: true, ...results }
+  })
+
+
+ipcMain.handle("select-catalog-import-source", async (event) => {
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+  const currentConfig = ctx.appConfig || appConfig || {};
+  const archiveExtensions = getConfiguredExtractionExtensions(currentConfig);
+  const gameExtensions = getConfiguredGameExtensions(currentConfig);
+  const sourceType = await dialog.showMessageBox(ownerWindow, {
+    type: "question",
+    title: "Choose import source",
+    message: "What do you want to import?",
+    buttons: ["Folder", "Archive or executable", "Cancel"],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+  });
+  if (sourceType.response === 2) return null;
+  const result = await showOpenDialog(ownerWindow, {
+    title: sourceType.response === 0 ? "Choose game folder" : "Choose archive or executable",
+    properties: [sourceType.response === 0 ? "openDirectory" : "openFile"],
+    ...(sourceType.response === 0 ? {} : {
+      filters: [
+        { name: "Game files and archives", extensions: [...new Set([...archiveExtensions, ...gameExtensions])] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    }),
+  });
+  if (result.canceled || !result.filePaths?.length) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle("import-catalog-entry", async (event, payload = {}) => {
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  if (ctx.activeImportSession) {
+    return { success: false, error: "Another import is already running" };
+  }
+
+  const catalog = payload.catalog || {};
+  const rawSourcePath = String(payload.sourcePath || "").trim();
+  const requestedVersion = String(payload.version || "").trim();
+  const conflictMode = String(payload.conflictMode || "check");
+  const deleteSourceArchiveAfterImport = payload.deleteSourceArchiveAfterImport === true;
+  const atlasId = toPositiveInteger(catalog.atlas_id ?? catalog.atlasId);
+  const f95Id = toPositiveInteger(catalog.f95_id ?? catalog.f95Id);
+  const lcId = getLewdCornerIdFromGame(catalog);
+  const steamId = toPositiveInteger(catalog.steam_id ?? catalog.steamId ?? catalog.steam_appid);
+  const gogId = toPositiveInteger(catalog.gog_id ?? catalog.gogId ?? catalog.gog_appid);
+
+  try {
+    if (!rawSourcePath) {
+      return { success: false, error: "Dropped path was empty" };
+    }
+    const sourcePath = path.resolve(rawSourcePath);
+    const stat = await fsp.stat(sourcePath).catch((err) => {
+      if (err?.code === "ENOENT") return null;
+      throw err;
+    });
+    if (!stat) {
+      return { success: false, error: "Dropped path does not exist" };
+    }
+    if (!stat.isDirectory() && !stat.isFile()) {
+      return { success: false, error: "Import source must be a folder or file" };
+    }
+
+    const currentConfig = ctx.appConfig || appConfig || {};
+    let targetLibrary = currentConfig?.Library?.gameFolder;
+    if (!targetLibrary || !fs.existsSync(targetLibrary)) {
+      const pick = await showOpenDialog(ownerWindow, {
+        title: "Choose Library folder for this import",
+        properties: ["openDirectory", "createDirectory"],
+      });
+      if (pick.canceled || !pick.filePaths?.length) {
+        return { success: false, canceled: true, error: "Library folder is required" };
+      }
+      targetLibrary = pick.filePaths[0];
+      const nextConfig = {
+        ...currentConfig,
+        Library: {
+          ...(currentConfig?.Library || {}),
+          gameFolder: targetLibrary,
+        },
+      };
+      fs.writeFileSync(configPath, ini.stringify(nextConfig));
+      ctx.appConfig = nextConfig;
+    }
+
+    const version = normalizeVersionName(requestedVersion || inferCatalogImportVersion(sourcePath, catalog));
+    const destinationFormat = currentConfig?.Library?.libraryFolderStructure || "{creator}/{title}/{version}";
+    const importGame = {
+      title: String(catalog.title || catalog.name || catalog.short_name || "Untitled").trim(),
+      creator: String(catalog.creator || catalog.developer || catalog.steam_developer || "Unknown").trim(),
+      engine: String(catalog.engine || "").trim(),
+      description: String(catalog.overview || catalog.description || "").trim(),
+      version,
+      atlasId,
+      f95Id,
+      lcId,
+      steamId,
+      // Was missing from this object while the resolution query below read the
+      // outer `gogId` directly. Now that both the lookup and the mapping writes
+      // take their ids from one identity object, it has to be on it.
+      gogId,
+    };
+
+    // Which record this belongs to, if any. The lookup itself now lives in
+    // library/catalogRecord.js so the download installer promoting a Browse
+    // download uses THIS implementation rather than a second copy of it — a
+    // second one would have been the fourth instance of one-rule-in-two-places
+    // in this area, and the previous three all failed silently.
+    //
+    // Resolved here and CREATED later (after extraction, below), which is why
+    // this is the resolve-only call: the version-conflict check needs to know
+    // whether a record exists before anything is extracted, but a record must
+    // not be created for an import that then fails to produce a game folder.
+    const catalogRecordDeps = buildCatalogRecordDeps();
+    const resolvedRecord = await resolveCatalogRecord(catalogRecordDeps, importGame);
+    let recordId = resolvedRecord.recordId;
+
+    if (recordId) {
+      const existingVersion = await dbGet(
+        db,
+        `SELECT rowid AS version_id, version FROM versions WHERE record_id = ? AND version = ? LIMIT 1`,
+        [recordId, version],
+      );
+      if (existingVersion && conflictMode === "check") {
+        let counter = 2;
+        let suggestedVersion = `${version} (${counter})`;
+        while (await dbGet(db, `SELECT 1 FROM versions WHERE record_id = ? AND version = ? LIMIT 1`, [recordId, suggestedVersion])) {
+          counter++;
+          suggestedVersion = `${version} (${counter})`;
+        }
+        return {
+          success: false,
+          conflict: true,
+          recordId,
+          existingVersion: existingVersion.version,
+          suggestedVersion,
+          message: `Version "${version}" already exists for this title.`,
+        };
+      }
+      if (existingVersion && conflictMode === "cancel") {
+        return { success: false, canceled: true, conflict: true };
+      }
+    }
+
+    const session = {
+      cancelRequested: false,
+      progress: 0,
+      total: 100,
+      cleanupPaths: [],
+      currentExtractionWorker: null,
+    };
+    ctx.activeImportSession = session;
+    const notify = (text, progress = 0, total = 100) => {
+      ownerWindow?.webContents?.send("import-progress", {
+        text,
+        progress,
+        total,
+        canCancel: false,
+      });
+    };
+
+    let gamePath = "";
+    let execPath = "";
+    let relativeExec = "";
+    const targetBase = getUniquePath(buildStructuredImportPath(targetLibrary, destinationFormat, importGame));
+    const extensions = getConfiguredGameExtensions(currentConfig);
+    const archiveExtensions = getConfiguredExtractionExtensions(currentConfig);
+    const sourceIsArchive = stat.isFile() && isArchiveFilePath(sourcePath, currentConfig);
+    if (stat.isFile() && !isArchiveFilePath(sourcePath, currentConfig)) {
+      const ext = path.extname(sourcePath).toLowerCase().replace(/^\./, "");
+      if (archiveExtensions.length > 0 && ["zip", "7z", "rar"].includes(ext) && !archiveExtensions.includes(ext)) {
+        return { success: false, error: `Archive type .${ext} is not enabled in extraction extensions` };
+      }
+      if (!extensions.includes(ext)) {
+        return { success: false, error: `Dropped path is not a supported folder/archive/launchable file: .${ext || "unknown"}` };
+      }
+    }
+
+    notify(`Importing ${importGame.title}...`, 5);
+
+    if (stat.isDirectory()) {
+      notify(`Copying ${importGame.title} to Library...`, 20);
+      await fsp.mkdir(path.dirname(targetBase), { recursive: true });
+      await fsp.cp(sourcePath, targetBase, { recursive: true });
+      gamePath = targetBase;
+      const execs = await findExecutables(gamePath, extensions);
+      relativeExec = execs[0] || "";
+      execPath = relativeExec ? path.join(gamePath, relativeExec) : "";
+    } else if (sourceIsArchive) {
+      const resolvedSevenZip = await resolveSevenZipExecutablePath({
+        configuredPath: currentConfig?.Library?.sevenZipPath,
+        currentConfig,
+        currentConfigPath: configPath,
+        ownerWindow,
+        notify: (text) => notify(text, 10),
+      });
+      if (!resolvedSevenZip?.path) throw new Error("7-Zip is required for archive import");
+      notify(`Extracting ${importGame.title}...`, 15);
+      const extraction = await extractArchiveWithFallback({
+        archivePath: sourcePath,
+        finalPath: targetBase,
+        sevenZipBin: resolvedSevenZip.path,
+        session,
+        progressWindow: ownerWindow,
+        useBundledRarExtractor:
+          isRarArchivePath(sourcePath) && resolvedSevenZip.source === "bundled",
+        currentConfig,
+        currentConfigPath: configPath,
+        ownerWindow,
+        notify: (text) => notify(text, 15),
+        label: importGame.title || "",
+      });
+      gamePath = extraction.finalPath || targetBase;
+
+      const items = await fsp.readdir(gamePath, { withFileTypes: true }).catch(() => []);
+      const dirs = items.filter((item) => item.isDirectory());
+      const files = items.filter((item) => item.isFile());
+      if (dirs.length === 1 && files.length === 0) {
+        const subPath = path.join(gamePath, dirs[0].name);
+        const subItems = await fsp.readdir(subPath);
+        for (const item of subItems) {
+          await fsp.rename(path.join(subPath, item), path.join(gamePath, item));
+        }
+        await fsp.rmdir(subPath).catch(() => {});
+      }
+
+      const execs = await findExecutables(gamePath, extensions);
+      relativeExec = execs[0] || "";
+      execPath = relativeExec ? path.join(gamePath, relativeExec) : "";
+    } else if (stat.isFile()) {
+      notify(`Copying ${path.basename(sourcePath)}...`, 25);
+      await fsp.mkdir(targetBase, { recursive: true });
+      const destFile = path.join(targetBase, path.basename(sourcePath));
+      await fsp.copyFile(sourcePath, destFile);
+      gamePath = targetBase;
+      relativeExec = path.basename(destFile);
+      execPath = destFile;
+    }
+
+    if (!gamePath) throw new Error("Import did not produce a game folder");
+
+    // Create the record if nothing was resolved, then write every mapping the
+    // catalog entry carries. Both live in library/catalogRecord.js, including
+    // the "Unknown"/"Untitled" fallbacks that used to be applied inline here —
+    // blank fields stay blank on the scan rows (the table should not show
+    // "Unknown"), so the fallbacks belong at the point of writing to the DB.
+    //
+    // Mappings are written whether or not the record is new, which is what this
+    // code always did: a title-matched record has no atlas mapping until
+    // something adds one, and without it no banner or metadata hydrates.
+    const ensured = await ensureCatalogRecord(catalogRecordDeps, importGame);
+    recordId = ensured.recordId;
+
+    notify(`Saving ${importGame.title} ${version}...`, 85);
+    await upsertVersion(
+      {
+        version,
+        folder: gamePath,
+        execPath,
+        selectedValue: relativeExec,
+      },
+      recordId,
+    );
+
+    notify(`Imported ${importGame.title}`, 100);
+    const refreshedGame = await getGame(recordId, getAssetBasePath(), process.defaultApp, getMediaStorageMode()).catch(() => null);
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) win.webContents.send("game-updated", refreshedGame || recordId);
+    });
+    let sourceArchiveDeleted = false;
+    let sourceArchiveDeleteError = "";
+    if (deleteSourceArchiveAfterImport && sourceIsArchive) {
+      const sourceCleanupRoot = path.dirname(sourcePath);
+      try {
+        const deleteResult = await deletePathWithElevationFallback(sourcePath, {
+          containmentRoot: sourceCleanupRoot,
+          recursive: false,
+          force: true,
+          description: `Delete source archive for ${importGame.title}`,
+          window: ownerWindow,
+          validatePath: (candidatePath) =>
+            validateSourceCleanupPath(candidatePath, sourceCleanupRoot),
+        });
+        if (deleteResult.success) {
+          sourceArchiveDeleted = true;
+        } else {
+          sourceArchiveDeleteError = deleteResult.error || "Source archive delete was skipped.";
+        }
+      } catch (deleteErr) {
+        sourceArchiveDeleteError = deleteErr.message || String(deleteErr);
+      }
+    }
+    return {
+      success: true,
+      recordId,
+      version,
+      gamePath,
+      execPath,
+      game: refreshedGame,
+      sourceArchiveDeleted,
+      sourceArchiveDeleteError,
+      mappings: { atlasId, f95Id, lcId, steamId },
+    };
+  } catch (err) {
+    console.error("import-catalog-entry error:", err);
+    return { success: false, error: err.message || String(err) };
+  } finally {
+    ctx.activeImportSession = null;
+  }
+});
+
+ipcMain.handle("import-local-game-version", async (event, payload = {}) => {
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  if (ctx.activeImportSession) {
+    return { success: false, error: "Another import is already running" };
+  }
+
+  const recordId = toPositiveInteger(payload.recordId || payload.record_id);
+  const rawSourcePath = String(payload.sourcePath || "").trim();
+  const version = normalizeVersionName(payload.version, "");
+  const replaceExisting = payload.replaceExisting === true;
+  const replaceVersionId = toPositiveInteger(payload.replaceVersionId || payload.versionId);
+  const deleteSourceArchiveAfterImport = payload.deleteSourceArchiveAfterImport === true;
+
+  let gamePath = "";
+  let importCommitted = false;
+  try {
+    if (!recordId) return { success: false, error: "Missing local game record" };
+    if (!rawSourcePath) return { success: false, error: "Dropped path was empty" };
+    if (!version) return { success: false, error: "Version is required" };
+
+    const gameRow = await dbGet(db, `SELECT record_id, title, creator, engine FROM games WHERE record_id = ? LIMIT 1`, [recordId]);
+    if (!gameRow) return { success: false, error: "Local game record was not found" };
+
+    const sourcePath = path.resolve(rawSourcePath);
+    const stat = await fsp.stat(sourcePath).catch((err) => {
+      if (err?.code === "ENOENT") return null;
+      throw err;
+    });
+    if (!stat) return { success: false, error: "Dropped path does not exist" };
+    if (!stat.isDirectory() && !stat.isFile()) {
+      return { success: false, error: "Import source must be a folder or file" };
+    }
+
+    let replaceRow = null;
+    if (replaceExisting) {
+      if (!replaceVersionId) return { success: false, error: "No replacement version selected" };
+      replaceRow = await dbGet(
+        db,
+        `SELECT rowid AS version_id, record_id, version, game_path, exec_path
+         FROM versions
+         WHERE rowid = ? AND record_id = ?
+         LIMIT 1`,
+        [replaceVersionId, recordId],
+      );
+      if (!replaceRow) return { success: false, error: "Replacement version does not belong to this game" };
+    } else {
+      const existingVersion = await dbGet(
+        db,
+        `SELECT rowid AS version_id FROM versions WHERE record_id = ? AND version = ? LIMIT 1`,
+        [recordId, version],
+      );
+      if (existingVersion) {
+        return {
+          success: false,
+          conflict: true,
+          error: "Version already exists. Enable replacement or choose a different version name.",
+        };
+      }
+    }
+
+    if (replaceExisting) {
+      const conflict = await dbGet(
+        db,
+        `SELECT rowid AS version_id FROM versions
+         WHERE record_id = ? AND version = ? AND rowid != ?
+         LIMIT 1`,
+        [recordId, version, replaceVersionId],
+      );
+      if (conflict) {
+        return { success: false, conflict: true, error: "Another version already uses that name." };
+      }
+    }
+
+    const currentConfig = ctx.appConfig || appConfig || {};
+    const destinationFormat = currentConfig?.Library?.libraryFolderStructure || "{creator}/{title}/{version}";
+    const importGame = {
+      title: gameRow.title || "Untitled",
+      creator: gameRow.creator || "Unknown",
+      engine: gameRow.engine || "Unknown",
+      version,
+    };
+
+    let targetBase;
+    if (replaceExisting && replaceRow?.game_path) {
+      // Replacing an existing version: place the new files in the SAME folder
+      // that holds the version being replaced (its parent = the title folder),
+      // named for the new version. Previously this derived a "library root" from
+      // the old path via path.dirname() and then re-applied
+      // {creator}/{title}/{version}, which double-nested creator/title
+      // (e.g. E:\Games\W.M\Dogma\W.M\Dogma\v0.4 S2) and pushed files past the
+      // Windows path limit so the executable scan came up empty.
+      const titleFolder = path.dirname(path.resolve(replaceRow.game_path));
+      targetBase = getUniquePath(path.join(titleFolder, sanitizePathSegment(version)));
+    } else {
+      let targetLibrary = currentConfig?.Library?.gameFolder;
+      if (!targetLibrary || !fs.existsSync(targetLibrary)) {
+        targetLibrary = path.join(dataDir, "games");
+      }
+      targetBase = getUniquePath(buildStructuredImportPath(targetLibrary, destinationFormat, importGame));
+    }
+    const extensions = getConfiguredGameExtensions(currentConfig);
+    const archiveExtensions = getConfiguredExtractionExtensions(currentConfig);
+    const sourceIsArchive = stat.isFile() && isArchiveFilePath(sourcePath, currentConfig);
+    console.log("[LocalImport] Starting import", {
+      recordId,
+      sourcePath,
+      version,
+      replaceExisting,
+      replaceVersionId,
+      sourceIsArchive,
+      deleteSourceArchiveAfterImport,
+      targetBase,
+    });
+
+    if (stat.isFile() && !sourceIsArchive) {
+      const ext = path.extname(sourcePath).toLowerCase().replace(/^\./, "");
+      if (archiveExtensions.length > 0 && ["zip", "7z", "rar"].includes(ext) && !archiveExtensions.includes(ext)) {
+        return { success: false, error: `Archive type .${ext} is not enabled in extraction extensions` };
+      }
+      if (!extensions.includes(ext)) {
+        return { success: false, error: `Dropped path is not a supported folder/archive/launchable file: .${ext || "unknown"}` };
+      }
+    }
+
+    const session = {
+      cancelRequested: false,
+      progress: 0,
+      total: 100,
+      cleanupPaths: [],
+      currentExtractionWorker: null,
+    };
+    ctx.activeImportSession = session;
+
+    let execPath = "";
+    let relativeExec = "";
+
+    if (stat.isDirectory()) {
+      await fsp.mkdir(path.dirname(targetBase), { recursive: true });
+      await fsp.cp(sourcePath, targetBase, { recursive: true });
+      gamePath = targetBase;
+      const execs = await findExecutables(gamePath, extensions);
+      console.log("[LocalImport] Folder executable scan", { gamePath, execCount: execs.length, execs });
+      relativeExec = execs[0] || "";
+      execPath = relativeExec ? path.join(gamePath, relativeExec) : "";
+    } else if (sourceIsArchive) {
+      const resolvedSevenZip = await resolveSevenZipExecutablePath({
+        configuredPath: currentConfig?.Library?.sevenZipPath,
+        currentConfig,
+        currentConfigPath: configPath,
+        ownerWindow,
+        notify: () => {},
+      });
+      if (!resolvedSevenZip?.path) throw new Error("7-Zip is required for archive import");
+      const extraction = await extractArchiveWithFallback({
+        archivePath: sourcePath,
+        finalPath: targetBase,
+        sevenZipBin: resolvedSevenZip.path,
+        session,
+        progressWindow: ownerWindow,
+        useBundledRarExtractor:
+          isRarArchivePath(sourcePath) && resolvedSevenZip.source === "bundled",
+        currentConfig,
+        currentConfigPath: configPath,
+        ownerWindow,
+        notify: () => {},
+        label: importGame.title || "",
+      });
+      gamePath = extraction.finalPath || targetBase;
+      console.log("[LocalImport] Archive extracted", { sourcePath, gamePath });
+      const items = await fsp.readdir(gamePath, { withFileTypes: true }).catch(() => []);
+      const dirs = items.filter((item) => item.isDirectory());
+      const files = items.filter((item) => item.isFile());
+      if (dirs.length === 1 && files.length === 0) {
+        const subPath = path.join(gamePath, dirs[0].name);
+        const subItems = await fsp.readdir(subPath);
+        for (const item of subItems) {
+          await fsp.rename(path.join(subPath, item), path.join(gamePath, item));
+        }
+        await fsp.rmdir(subPath).catch(() => {});
+        console.log("[LocalImport] Flattened single archive root", { gamePath, subPath });
+      }
+      const execs = await findExecutables(gamePath, extensions);
+      console.log("[LocalImport] Archive executable scan", { gamePath, execCount: execs.length, execs });
+      relativeExec = execs[0] || "";
+      execPath = relativeExec ? path.join(gamePath, relativeExec) : "";
+    } else {
+      await fsp.mkdir(targetBase, { recursive: true });
+      const destFile = path.join(targetBase, path.basename(sourcePath));
+      await fsp.copyFile(sourcePath, destFile);
+      gamePath = targetBase;
+      relativeExec = path.basename(destFile);
+      execPath = destFile;
+    }
+
+    if (!gamePath) throw new Error("Import did not produce a game folder");
+    if (!execPath) {
+      const sourceKind = sourceIsArchive ? "archive" : stat.isDirectory() ? "folder" : "file";
+      throw new Error(
+        `No launchable file was found in the imported ${sourceKind}. Source: ${sourcePath}. Imported folder: ${gamePath}`,
+      );
+    }
+
+    const oldVersionPath = replaceRow?.game_path ? path.resolve(replaceRow.game_path) : "";
+    const oldVersionExists = oldVersionPath ? fs.existsSync(oldVersionPath) : false;
+    const oldVersionAllowed = oldVersionPath ? await isAllowedDeletionPath(recordId, oldVersionPath) : false;
+    const newVersionPath = path.resolve(gamePath);
+    console.log("[LocalImport] Replacement cleanup check", {
+      recordId,
+      replaceExisting,
+      oldVersionPath,
+      oldVersionExists,
+      oldVersionAllowed,
+      newVersionPath,
+    });
+
+    if (replaceExisting) {
+      await updateVersion(
+        {
+          version_id: replaceVersionId,
+          previousVersion: replaceRow.version,
+          version,
+          game_path: gamePath,
+          exec_path: execPath,
+        },
+        recordId,
+      );
+      const folderSize = await calculatePathSizeSafe(gamePath);
+      if (folderSize !== null) await updateFolderSize(recordId, version, folderSize);
+    } else {
+      await upsertVersion({ version, folder: gamePath, execPath, selectedValue: relativeExec }, recordId);
+    }
+    importCommitted = true;
+
+    const refreshedGame = await getGame(recordId, getAssetBasePath(), process.defaultApp, getMediaStorageMode()).catch(() => null);
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) win.webContents.send("game-updated", refreshedGame || recordId);
+    });
+
+    let oldVersionDeleted = false;
+    let oldVersionDeleteError = "";
+    if (replaceExisting && oldVersionPath) {
+      try {
+        if (normalizeForPathCompare(oldVersionPath) === normalizeForPathCompare(newVersionPath)) {
+          console.log("[LocalImport] Skipping old version cleanup because old and new paths match", { oldVersionPath });
+        } else if (!oldVersionExists) {
+          console.log("[LocalImport] Skipping old version cleanup because old path no longer exists", { oldVersionPath });
+        } else if (!oldVersionAllowed) {
+          oldVersionDeleteError = "Old version files were not deleted because the old path is not trusted for deletion.";
+        } else {
+          const parsedPath = path.parse(oldVersionPath);
+          const oldStat = await fsp.stat(oldVersionPath).catch(() => null);
+          if (oldVersionPath === parsedPath.root) {
+            oldVersionDeleteError = "Old version files were not deleted because Atlas refused to delete a drive root.";
+          } else if (!oldStat?.isDirectory()) {
+            oldVersionDeleteError = "Old version files were not deleted because the old path is not a folder.";
+          } else {
+            const deleteResult = await deletePathWithElevationFallback(oldVersionPath, {
+              containmentRoot: currentConfig?.Library?.gameFolder || null,
+              recursive: true,
+              force: true,
+              description: `Delete old version ${replaceRow.version || ""}`.trim(),
+              window: ownerWindow,
+              validatePath: async (candidatePath) => {
+                if (candidatePath === path.parse(candidatePath).root) throw new Error("Refusing to delete a drive root");
+                if (normalizeForPathCompare(candidatePath) !== normalizeForPathCompare(oldVersionPath)) {
+                  throw new Error("Refusing to delete a path other than the replaced version folder");
+                }
+                if (!oldVersionAllowed) throw new Error("Old version path is not trusted for deletion");
+                if (normalizeForPathCompare(candidatePath) === normalizeForPathCompare(newVersionPath)) {
+                  throw new Error("Refusing to delete the newly imported version folder");
+                }
+              },
+            });
+            if (deleteResult.success) {
+              oldVersionDeleted = true;
+              await removeEmptyParentDirectories(oldVersionPath, currentConfig?.Library?.gameFolder);
+            } else {
+              oldVersionDeleteError = deleteResult.error || "Old version delete was skipped.";
+            }
+          }
+        }
+      } catch (deleteErr) {
+        oldVersionDeleteError = deleteErr.message || String(deleteErr);
+      }
+      if (oldVersionDeleteError) {
+        console.warn("[LocalImport] Old version cleanup failed:", oldVersionDeleteError);
+      }
+    }
+
+    let sourceArchiveDeleted = false;
+    let sourceArchiveDeleteError = "";
+    if (deleteSourceArchiveAfterImport && sourceIsArchive) {
+      try {
+        const sourceCleanupRoot = path.dirname(sourcePath);
+        const deleteResult = await deletePathWithElevationFallback(sourcePath, {
+          containmentRoot: sourceCleanupRoot,
+          recursive: false,
+          force: true,
+          description: `Delete source archive for ${gameRow.title || "imported game"}`,
+          window: ownerWindow,
+          validatePath: (candidatePath) =>
+            validateSourceCleanupPath(candidatePath, sourceCleanupRoot),
+        });
+        if (deleteResult.success) {
+          sourceArchiveDeleted = true;
+          await removeEmptyParentDirectories(sourcePath, sourceCleanupRoot);
+        } else {
+          sourceArchiveDeleteError = deleteResult.error || "Source archive delete was skipped.";
+        }
+      } catch (deleteErr) {
+        sourceArchiveDeleteError = deleteErr.message || String(deleteErr);
+      }
+      if (sourceArchiveDeleteError) {
+        console.warn("[LocalImport] Source archive cleanup failed:", sourceArchiveDeleteError);
+      }
+    }
+
+    ownerWindow?.webContents?.send("import-progress", {
+      text: `${replaceExisting ? "Replacement" : "Import"} complete`,
+      progress: 100,
+      total: 100,
+      canCancel: false,
+      complete: true,
+      done: true,
+      phase: "done",
+    });
+    ownerWindow?.webContents?.send("import-complete");
+    return {
+      success: true,
+      recordId,
+      version,
+      gamePath,
+      execPath,
+      replaced: replaceExisting,
+      oldVersionDeleted,
+      oldVersionDeleteError,
+      sourceArchiveDeleted,
+      sourceArchiveDeleteError,
+      game: refreshedGame,
+    };
+  } catch (err) {
+    console.error("import-local-game-version error:", err);
+    if (gamePath && !importCommitted) {
+      // Both targetBase and currentConfig are declared inside the try, so
+      // neither is in scope here; re-read the config rather than widening them.
+      // The two roots below are the only places this handler ever writes.
+      const failureConfig = ctx.appConfig || appConfig || {};
+      await removePathIfExists(gamePath, [
+        failureConfig?.Library?.gameFolder,
+        path.join(dataDir, "games"),
+      ].filter(Boolean));
+    }
+    ownerWindow?.webContents?.send("import-progress", {
+      text: `Import failed: ${err.message || String(err)}`,
+      progress: 100,
+      total: 100,
+      canCancel: false,
+      complete: true,
+      phase: "failed",
+    });
+    return { success: false, error: err.message || String(err) };
+  } finally {
+    ctx.activeImportSession = null;
+  }
+});
+
+ipcMain.handle("cancel-import", async () => {
+  if (!ctx.activeImportSession) {
+    return { success: false, message: "No import is currently running" };
+  }
+
+  ctx.activeImportSession.cancelRequested = true;
+  ctx.activeImportSession.currentExtractionWorker?.postMessage("cancel");
+  mainWindow?.webContents.send("import-progress", {
+    text: "Cancel requested. Cleaning up current import...",
+    progress: ctx.activeImportSession.progress || 0,
+    total: ctx.activeImportSession.total || 0,
+    canceling: true,
+    canCancel: false,
+  });
+  return { success: true };
+});
+
+ipcMain.handle("start-scan", async (event, params) => {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  if (ctx.activeScanSession && !ctx.activeScanSession.finished) {
+    return { success: false, error: "Another scan is already running" };
+  }
+
+  const session = {
+    scanId: params?.scanId || `scan-${Date.now()}-${nextScanId++}`,
+    canceled: false,
+    cancelRequested: false,
+    startedAt: Date.now(),
+    finished: false,
+  };
+  ctx.activeScanSession = session;
+  try {
+    await startScan(params, window, session);
+    session.finished = true;
+    return { success: true, canceled: false, scanId: session.scanId };
+  } catch (err) {
+    session.finished = true;
+    if (err?.canceled || err?.code === "SCAN_CANCELED") {
+      return { success: false, canceled: true, error: "Scan canceled", scanId: session.scanId };
+    }
+    return { success: false, canceled: false, error: err.message, scanId: session.scanId };
+  } finally {
+    session.finished = true;
+    if (ctx.activeScanSession?.scanId === session.scanId) {
+      ctx.activeScanSession = null;
+    }
+  }
+});
+
+const makeRenpyImportRow = async (saveRow, searchAtlas, db) => {
+  const base = {
+    ...saveRow,
+    title: saveRow.inferredTitle || saveRow.saveId || "Unknown",
+    creator: "Unknown",
+    engine: "Ren'Py",
+    version: "No version",
+    selectedValue: "",
+    singleExecutable: "N/A",
+    multipleVisible: "hidden",
+    executables: [],
+    isArchive: false,
+    scanStatus: "new",
+    scanMessage: "Ready as Uninstalled",
+    resultVisibility: "hidden",
+    results: [],
+    resultSelectedValue: "",
+    atlasId: "",
+    f95Id: "",
+    steamId: "",
+    gogId: "",
+  };
+
+  let matches = [];
+  try {
+    matches = await searchAtlas(base.title, "");
+  } catch (err) {
+    console.warn("Ren'Py save metadata match failed:", err.message || err);
+  }
+
+  if (matches.length === 1) {
+    const match = matches[0];
+    base.atlasId = String(match.atlas_id || "");
+    base.f95Id = match.f95_id || "";
+    base.title = match.title || base.title;
+    base.creator = match.creator || base.creator;
+    base.engine = match.engine || base.engine;
+    base.description = match.overview || match.description || "";
+    base.siteUrl = match.siteUrl || match.site_url || "";
+    base.results = [{ key: "match", value: "Match Found" }];
+    base.resultSelectedValue = "match";
+    base.resultVisibility = "visible";
+  } else if (matches.length > 1) {
+    base.results = matches.map((match) => ({
+      key: String(match.atlas_id),
+      value: `${match.atlas_id} | ${match.f95_id || ""} | ${match.title} | ${match.creator}`,
+    }));
+    base.resultSelectedValue = base.results[0]?.key || "";
+    base.resultVisibility = "visible";
+  }
+
+  const existing = await findExistingRenpyRecord(base, db).catch(() => null);
+  if (existing?.record_id) {
+    base.recordId = existing.record_id;
+    base.existingRecordId = existing.record_id;
+    base.scanMessage = "Already in Library";
+  }
+
+  return base;
+};
+
+const findExistingRenpyRecord = async (game, db) => {
+  const atlasId = toPositiveInteger(game.atlasId || game.atlas_id);
+  const f95Id = toPositiveInteger(game.f95Id || game.f95_id);
+  const lcId = getLewdCornerIdFromGame(game);
+  const steamId = toPositiveInteger(game.steamId || game.steam_id);
+  const gogId = toPositiveInteger(game.gogId || game.gog_id);
+  const title = String(game.title || "").trim();
+  const creator = String(game.creator || "Unknown").trim() || "Unknown";
+  const engine = String(game.engine || "Ren'Py").trim() || "Ren'Py";
+
+  if (atlasId || f95Id || lcId || steamId || gogId) {
+    const row = await dbGet(
+      db,
+      `SELECT record_id FROM atlas_mappings WHERE ? IS NOT NULL AND atlas_id = ?
+       UNION
+       SELECT record_id FROM lewdcorner_mappings WHERE ? IS NOT NULL AND lc_id = ?
+       UNION
+       SELECT record_id FROM f95_zone_mappings WHERE ? IS NOT NULL AND f95_id = ?
+       UNION
+       SELECT record_id FROM steam_mappings WHERE ? IS NOT NULL AND steam_id = ?
+       UNION
+       SELECT record_id FROM gog_mappings WHERE ? IS NOT NULL AND gog_id = ?
+       LIMIT 1`,
+      [atlasId, atlasId, lcId, lcId, f95Id, f95Id, steamId, steamId, gogId, gogId],
+    );
+    if (row?.record_id) return row;
+    if (lcId) {
+      const recordId = await findRecordByLewdCornerId(lcId);
+      if (recordId) return { record_id: recordId };
+    }
+  }
+
+  if (!title) return null;
+  return await dbGet(
+    db,
+    `SELECT record_id FROM games
+     WHERE (title = ? AND creator = ?)
+        OR (title = ? AND creator = 'Unknown' AND engine = ?)
+        OR (title = ? AND engine = ?)
+     ORDER BY
+       CASE
+         WHEN title = ? AND creator = ? THEN 0
+         WHEN title = ? AND creator = 'Unknown' AND engine = ? THEN 1
+         ELSE 2
+       END
+     LIMIT 1`,
+    [title, creator, title, engine, title, engine, title, creator, title, engine],
+  );
+};
+
+// ── External library imports (F95Checker, and whatever comes next) ───────────
+//
+// Three handlers, all provider-agnostic: what tools exist, where a tool's data
+// is, and read it. The rows come back in the same shape a folder scan produces,
+// so the renderer feeds them straight into the existing review table and the
+// existing import writer takes them from there.
+
+ipcMain.handle("list-external-libraries", async () => {
+  try {
+    return { success: true, providers: listProviders() };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
+// Detection status for the Settings cards: is the tool's database where we
+// expect it, and if not, which directories did we look in.
+ipcMain.handle("describe-external-library", async (event, id) => {
+  try {
+    return describeProvider(id);
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
+// Manual picker fallback, used when auto-detection finds nothing (a portable
+// install, a non-default data directory, a database copied off another machine).
+ipcMain.handle("select-external-library-file", async (event, id) => {
+  const provider = getProvider(id);
+  if (!provider) return { success: false, error: `Unknown external library: ${id}` };
+  const parentWindow = BrowserWindow.fromWebContents(event.sender);
+  const result = await dialog.showOpenDialog(parentWindow, {
+    // Not every provider's input is a database — XLibrary's is a JSON library
+    // file — and a dialog naming the wrong kind of file is how a user concludes
+    // they have nothing to select.
+    title: `Select the ${provider.label} ${provider.sourceNoun || "database"}`,
+    properties: ["openFile"],
+    filters: provider.fileFilters,
+  });
+  if (result.canceled || !result.filePaths?.length) {
+    return { success: false, canceled: true };
+  }
+  return { success: true, path: result.filePaths[0] };
+});
+
+ipcMain.handle("scan-external-library", async (event, { id, path: dbPath = "" } = {}) => {
+  try {
+    return await readProviderLibrary(id, dbPath);
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
+// ── Wishlist rows from an import ────────────────────────────────────────────
+//
+// Rows the user marked in the review table as "watch, don't import". These are
+// games another tool is tracking that have nothing on disk here, so creating a
+// library record for them would produce an entry with no version and no launch
+// path. They go to the wishlist instead, keeping whatever catalog identity the
+// match step resolved so the entry still hydrates a banner and metadata.
+//
+// addWishlistEntry already refuses a game that is in the library (it checks the
+// mapping tables), so a row the user mis-flagged cannot shadow a real record —
+// it comes back as `inLibrary` and is reported as skipped rather than failed.
+ipcMain.handle("add-import-wishlist-entries", async (event, games = []) => {
+  const rows = Array.isArray(games) ? games : [];
+  let added = 0;
+  let skipped = 0;
+  const failures = [];
+
+  for (const row of rows) {
+    if (!row) continue;
+    try {
+      const rowLcId = getLewdCornerIdFromGame(row);
+      const rowF95Id = row.f95Id || row.f95_id || null;
+      const result = await addWishlistEntry({
+        // Left unset when the row carries no source id, so normalizeSource
+        // derives it (and the identity key) the same way the renderer's
+        // getWishlistIdentityKey does. Asserting "f95" for a game with no F95
+        // id would produce an identity key the UI would never match against.
+        source: rowF95Id ? "f95" : rowLcId ? "lewdcorner" : undefined,
+        atlas_id: row.atlasId || row.atlas_id || null,
+        f95_id: rowF95Id,
+        lc_id: rowLcId || null,
+        title: row.title,
+        creator: row.creator,
+        engine: row.engine && row.engine !== "Unknown" ? row.engine : null,
+        // The version the OTHER tool knows about is the thing the user is
+        // waiting on, so it is the useful one to record here — not the
+        // installed version, which by definition does not exist for these rows.
+        latest_version: row.latestVersion || row.version || null,
+        overview: row.description || row.overview || null,
+        site_url: row.sourceUrl || row.siteUrl || null,
+        note: row.externalState?.notes || null,
+      });
+      if (result?.success) added += 1;
+      else if (result?.inLibrary) skipped += 1;
+      else failures.push({ title: row.title, error: "Could not add to wishlist" });
+    } catch (err) {
+      failures.push({ title: row.title, error: err.message || String(err) });
+    }
+  }
+
+  return { success: failures.length === 0, added, skipped, failures };
+});
+
+ipcMain.handle("select-renpy-save-directory", async (event) => {
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+  const result = await showOpenDialog(ownerWindow, {
+    title: "Select Ren'Py save folder",
+    properties: ["openDirectory"],
+  });
+  if (result.canceled || !result.filePaths?.length) return null;
+  return result.filePaths[0];
+});
+
+ipcMain.handle("scan-renpy-saves", async (event, params = {}) => {
+  const rootPath = params.rootPath || getDefaultRenpySaveRoot(app);
+  const appDataPath = (() => {
+    try { return app.getPath("appData"); } catch { return ""; }
+  })();
+  const rootExists = Boolean(rootPath && fs.existsSync(rootPath));
+  console.log("Ren'Py save scan starting", {
+    platform: process.platform,
+    envAPPDATA: process.env.APPDATA || "",
+    appDataPath,
+    rootPath: rootPath || "",
+    rootExists,
+  });
+  if (!rootPath || !rootExists) {
+    return {
+      success: false,
+      needsSelection: true,
+      canSelectManually: true,
+      rootPath: rootPath || "",
+      error: "Ren'Py save folder was not found",
+      message: "Ren'Py save folder was not found. Select it manually.",
+    };
+  }
+
+  try {
+    const scanResult = await scanRenpySaveFolders(rootPath);
+    const rows = scanResult.rows || [];
+    console.log("Ren'Py save scan folders", {
+      rootPath: scanResult.rootPath,
+      totalFolders: scanResult.totalFolders,
+      skippedFolders: scanResult.skippedFolders,
+      sampleFolders: scanResult.sampleFolders,
+    });
+    const games = [];
+    for (const row of rows) {
+      games.push(await makeRenpyImportRow(row, searchAtlas, db));
+    }
+    return {
+      success: true,
+      rootPath: scanResult.rootPath || rootPath,
+      games,
+      rows: games,
+      totalFolders: scanResult.totalFolders,
+      skippedFolders: scanResult.skippedFolders,
+      warning: scanResult.totalFolders === 0 ? `Found 0 folders in ${scanResult.rootPath || rootPath}` : "",
+    };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
+ipcMain.handle("import-renpy-save-games", async (event, games = []) => {
+  const rows = Array.isArray(games) ? games : [];
+  const results = [];
+  for (const row of rows) {
+    try {
+      const savePath = path.resolve(String(row.savePath || row.folder || ""));
+      const stat = await fsp.stat(savePath).catch(() => null);
+      if (!stat?.isDirectory()) {
+        results.push({ success: false, title: row.title, error: "Ren'Py save path is not a folder" });
+        continue;
+      }
+
+      const importGame = {
+        title: String(row.title || row.inferredTitle || row.saveId || "Unknown").trim() || "Unknown",
+        creator: String(row.creator || "Unknown").trim() || "Unknown",
+        engine: "Ren'Py",
+        description: row.description || row.overview || null,
+      };
+      let recordId = row.recordId || row.existingRecordId || null;
+      if (!recordId) {
+        const existing = await findExistingRenpyRecord({ ...row, ...importGame }, db);
+        if (existing?.record_id) recordId = existing.record_id;
+      }
+      if (!recordId) recordId = await addGame(importGame);
+      if (importGame.description) {
+        await updateGame({ ...importGame, record_id: recordId });
+      }
+      if (row.atlasId) await addAtlasMapping(recordId, row.atlasId);
+      const rowLcId = getLewdCornerIdFromGame(row);
+      if (rowLcId) await addLewdCornerMapping(recordId, rowLcId);
+      if (row.f95Id) {
+        await dbRun(
+          db,
+          `INSERT INTO f95_zone_mappings (record_id, f95_id)
+           SELECT ?, ?
+           WHERE NOT EXISTS (
+             SELECT 1 FROM f95_zone_mappings WHERE record_id = ? AND f95_id = ?
+           )`,
+          [recordId, row.f95Id, recordId, row.f95Id],
+        );
+      }
+      if (row.steamId) await addSteamMapping(recordId, parseInt(row.steamId, 10));
+      if (row.gogId) await addGogMapping(recordId, parseInt(row.gogId, 10));
+
+      const refreshedGame = await getGame(recordId, getAssetBasePath(), process.defaultApp, getMediaStorageMode()).catch(() => null);
+      BrowserWindow.getAllWindows().forEach((win) => {
+        if (!win.isDestroyed()) win.webContents.send("game-updated", refreshedGame || recordId);
+      });
+      results.push({ success: true, recordId, title: importGame.title });
+    } catch (err) {
+      results.push({ success: false, title: row.title, error: err.message || String(err) });
+    }
+  }
+  return { success: true, results };
+});
+
+ipcMain.handle("cancel-scan", async () => {
+  if (ctx.activeScanSession) {
+    ctx.activeScanSession.canceled = true;
+    ctx.activeScanSession.cancelRequested = true;
+    return { success: true, scanId: ctx.activeScanSession.scanId };
+  }
+  return { success: false, error: "No scan is currently running" };
+});
+
+ipcMain.handle("get-steam-game-data", async (event, steamId) => {
+  return await fetchAndStoreSteamData(db, steamId, ctx.appConfig?.Metadata?.steamAssetSourceOrder);
+});
+
+ipcMain.handle("get-gog-game-data", async (event, gogId) => {
+  return await fetchAndStoreGogData(db, gogId);
+});
+
+ipcMain.handle("search-atlas", async (event, params) => {
+  return await searchAtlas(params.title, params.creator);
+});
+
+ipcMain.handle("resolve-import-matches", async (event, games = []) => {
+  const searchCache = new Map();
+
+  // An id lookup that finds nothing is not the same as "this game is not in the
+  // catalog". A thread id can be absent from Atlas's F95 mappings while the game
+  // itself is present under an Atlas or LewdCorner id, and a row imported from
+  // another tool can carry a thread id for a duplicate/moved thread. Falling
+  // through to title + creator gives the user a candidate list to choose from
+  // instead of a bare "no match", which is what the external-library reader has
+  // always documented this handler as doing.
+  //
+  // HOW the match was found is returned alongside it, and matters: a row's
+  // thread id is only PROVEN to belong to the matched catalog game when the id
+  // lookup is what found it. If a title fallback found it instead, stamping the
+  // unverified id onto the row would write a f95_zone_mappings / lewdcorner_
+  // mappings row asserting a link the catalog does not make. So a fallback
+  // match contributes its metadata but never its caller-supplied id.
+  const resolveSearchData = async (game = {}) => {
+    const f95Id = normalizeF95IdInput(game.f95Id);
+    const lcId = normalizeLewdCornerIdInput(game.lcId || game.lewdCornerId);
+    const title = game.lookupTitle || game.title;
+
+    if (f95Id) {
+      const byF95 = await searchAtlasByF95Id(f95Id);
+      if (byF95?.length) return { rows: byF95, matchedBy: "f95Id" };
+    }
+    if (lcId) {
+      const byLc = await searchAtlasByLewdCornerId(lcId);
+      if (byLc?.length) return { rows: byLc, matchedBy: "lcId" };
+    }
+    const byTitle = await searchAtlas(title, game.creator);
+    return {
+      rows: byTitle || [],
+      // "fallback" only when an id lookup was actually tried and missed. A row
+      // with no ids at all has always been title-matched and is not newly
+      // uncertain, so it keeps the plain "Match Found" wording.
+      matchedBy: f95Id || lcId ? "titleFallback" : "title",
+    };
+  };
+
+  // ── Pre-warm search cache for all unique keys in parallel ──────────────
+  const pending = games.filter(
+    (g) => g && g.scanStatus === "pendingMatch",
+  );
+
+  const uniqueSearches = new Map();
+  for (const game of pending) {
+    const f95Id = normalizeF95IdInput(game.f95Id);
+    const lcId = normalizeLewdCornerIdInput(game.lcId || game.lewdCornerId);
+    const cacheKey = f95Id
+      ? `f95:${f95Id}`
+      : lcId
+        ? `lc:${lcId}`
+        : `atlas:${game.lookupTitle || game.title}|${game.creator}`;
+    if (!uniqueSearches.has(cacheKey)) {
+      uniqueSearches.set(cacheKey, { f95Id, lcId, game });
+    }
+  }
+
+  await Promise.all(
+    Array.from(uniqueSearches.entries()).map(async ([cacheKey, { game }]) => {
+      try {
+        const data = await resolveSearchData(game);
+        searchCache.set(cacheKey, data);
+      } catch (err) {
+        console.error("resolve-import-matches pre-warm failed:", err);
+        searchCache.set(cacheKey, { rows: [], matchedBy: "none" });
+      }
+    }),
+  );
+
+  // ── Resolve all games in parallel using the warmed cache ───────────────
+  const resolveGame = async (game) => {
+    if (!game || game.scanStatus !== "pendingMatch") {
+      return game;
+    }
+
+    const f95Id = normalizeF95IdInput(game.f95Id);
+    const lcId = normalizeLewdCornerIdInput(game.lcId || game.lewdCornerId);
+    const cacheKey = f95Id
+      ? `f95:${f95Id}`
+      : lcId
+        ? `lc:${lcId}`
+        : `atlas:${game.lookupTitle || game.title}|${game.creator}`;
+
+    try {
+      const cached = searchCache.get(cacheKey) || { rows: [], matchedBy: "none" };
+      const data = cached.rows || [];
+      const isFallback = cached.matchedBy === "titleFallback";
+
+      // Withhold the unverified id from a fallback match so no mapping is
+      // written for a link the catalog does not assert. applyImportMatchData
+      // falls back to `game.f95Id`/`game.lcId` as well as to its options
+      // argument, so both have to be overridden explicitly — passing an empty
+      // options object is not enough to stop the row's own id coming through.
+      const withVerifiedIdsOnly = (matched, match) => (isFallback
+        ? {
+            ...matched,
+            f95Id: String(match.f95_id || match.f95Id || ""),
+            lcId: String(match.lc_id || match.lcId || match.lewdCornerId || ""),
+            lewdCornerId: String(match.lc_id || match.lcId || match.lewdCornerId || ""),
+            // Kept so the review table can still show the user which id came
+            // out of the source library and failed to resolve.
+            unverifiedF95Id: f95Id || "",
+            unverifiedLcId: lcId || "",
+            matchedByTitleFallback: true,
+          }
+        : matched);
+
+      if (data.length === 1) {
+        return await hydrateImportMatch({
+          ...withVerifiedIdsOnly(
+            applyImportMatchData(game, data[0], isFallback ? {} : { f95Id, lcId }),
+            data[0],
+          ),
+          results: [{
+            key: "match",
+            value: isFallback ? "Title match (ID not in catalog)" : "Match Found",
+          }],
+          resultSelectedValue: "match",
+          resultVisibility: "visible",
+        }, "match");
+      } else if (data.length > 1) {
+        const results = data.map(buildImportMatchResult).filter((result) => result.key);
+        // hydrateImportMatch also falls back to the row's own f95Id/lcId when
+        // the candidate the user picks has none, so the unverified ids are
+        // stripped from the row itself before the candidate list is built.
+        const base = isFallback
+          ? {
+              ...game,
+              f95Id: "",
+              lcId: "",
+              lewdCornerId: "",
+              unverifiedF95Id: f95Id || "",
+              unverifiedLcId: lcId || "",
+              matchedByTitleFallback: true,
+            }
+          : game;
+        return await chooseInstalledImportMatch({ ...base, results }, results);
+      } else {
+        const unmatchedGame = await hydrateImportMatch({
+          ...game,
+          atlasId: "",
+          f95Id: f95Id || "",
+          lcId: lcId || game.lcId || game.lewdCornerId || "",
+          lewdCornerId: lcId || game.lewdCornerId || game.lcId || "",
+          results: [],
+          resultSelectedValue: "",
+          resultVisibility: "hidden",
+        }, "");
+        // Both the id lookup AND the title fallback came back empty, so say so
+        // rather than implying only the id was tried.
+        return f95Id
+          ? { ...unmatchedGame, f95Id, scanMessage: "No F95 or title match found" }
+          : lcId
+            ? { ...unmatchedGame, lcId, lewdCornerId: lcId, scanMessage: "No LewdCorner or title match found" }
+          : unmatchedGame;
+      }
+    } catch (err) {
+      console.error("resolve-import-matches row failed:", err);
+      return {
+        ...game,
+        scanStatus: "new",
+        scanMessage: game.isArchive ? "Archive" : "Ready to import",
+      };
+    }
+  };
+
+  return Promise.all(games.map(resolveGame));
+});
+
+ipcMain.handle("search-atlas-by-f95-id", async (event, f95Id) => {
+  const normalizedF95Id = normalizeF95IdInput(f95Id);
+  console.log(`IPC search-atlas-by-f95-id received f95Id: ${f95Id}`);
+  if (!normalizedF95Id) return [];
+  try {
+    const result = await searchAtlasByF95Id(normalizedF95Id);
+    console.log(
+      `IPC search-atlas-by-f95-id result for ${normalizedF95Id}: ${JSON.stringify(result)}`,
+    );
+    return result;
+  } catch (err) {
+    console.error(`Error in search-atlas-by-f95-id for ${normalizedF95Id}:`, err);
+    return [];
+  }
+});
+
+ipcMain.handle("search-atlas-by-lewdcorner-id", async (event, lcId) => {
+  const normalizedLcId = normalizeLewdCornerIdInput(lcId);
+  console.log(`IPC search-atlas-by-lewdcorner-id received lcId: ${lcId}`);
+  if (!normalizedLcId) return [];
+  try {
+    const result = await searchAtlasByLewdCornerId(normalizedLcId);
+    console.log(
+      `IPC search-atlas-by-lewdcorner-id result for ${normalizedLcId}: ${JSON.stringify(result)}`,
+    );
+    return result;
+  } catch (err) {
+    console.error(`Error in search-atlas-by-lewdcorner-id for ${normalizedLcId}:`, err);
+    return [];
+  }
+});
+
+ipcMain.handle("add-atlas-mapping", async (event, { recordId, atlasId }) => {
+  try {
+    return await addAtlasMapping(recordId, atlasId);
+  } catch (err) {
+    console.error("Error in add-atlas-mapping:", err);
+    return [];
+  }
+});
+
+ipcMain.handle("find-f95-id", async (event, atlasId) => {
+  try {
+    return await findF95Id(atlasId);
+  } catch (err) {
+    console.error("Error in find-f95-id:", err);
+    return "";
+  }
+});
+
+ipcMain.handle("get-atlas-data", async (event, atlasId) => {
+  try {
+    return await getAtlasData(atlasId);
+  } catch (err) {
+    console.error("Error in get-atlas-data:", err);
+    return {};
+  }
+});
+
+ipcMain.handle("get-import-record-status", async (event, game) => {
+  try {
+    return await getImportRecordStatus(game);
+  } catch (err) {
+    console.error("get-import-record-status error:", err);
+    return { status: "new", recordId: null, exactPath: false };
+  }
+});
+
+ipcMain.handle("import-games", async (event, params) => {
+  if (ctx.activeImportSession) {
+    return {
+      success: false,
+      error: "Another import is already running",
+    };
+  }
+
+  const {
+    games: submittedGames,
+    sourceRoot,
+    deleteAfter,
+    deleteSourceArchiveAfterImport,
+    scanSize,
+    downloadBannerImages,
+    downloadPreviewImages,
+    previewLimit,
+    downloadVideos,
+    gameExt,
+    forceReimport = false,
+    moveFoldersToLibrary = false,
+    libraryFormat,
+    // Set only by an external-library import (F95Checker etc). Controls the two
+    // opt-in mappings; the rest of the user state always comes across.
+    externalLibraryOptions = {},
+  } = params;
+  // One resolver per import run so a shared tab name creates a single collection
+  // and the collection list is read once rather than per row.
+  const resolveExternalCollection = makeCollectionResolver();
+  const externalStateWarnings = [];
+  const shouldDeleteSourceArchive =
+    deleteSourceArchiveAfterImport === true || (deleteSourceArchiveAfterImport === undefined && deleteAfter === true);
+  const auditImportCleanup = (stage, details = {}) => {
+    const entry = {
+      timestamp: new Date().toISOString(),
+      stage,
+      deleteSourceArchiveAfterImport,
+      shouldDeleteSourceArchive,
+      ...details,
+    };
+    console.log("[ImportCleanupAudit]", JSON.stringify(entry));
+    try {
+      fs.appendFileSync(
+        path.join(dataDir, "replacement-audit.jsonl"),
+        `${JSON.stringify(entry)}\n`,
+        "utf8",
+      );
+    } catch (auditErr) {
+      console.warn("Failed to write import cleanup audit:", auditErr.message);
+    }
+  };
+  auditImportCleanup("import-options", { sourceRoot, submittedGameCount: submittedGames.length });
+
+  const games = submittedGames.filter(
+    (game) =>
+      ["new", "repairPath", "steamVersion"].includes(game.scanStatus || "new") ||
+      (forceReimport && game.scanStatus === "alreadyImported"),
+  );
+  // Always re-read the config for this run. The renderer can set the games
+  // folder moments before calling import-games (the "Set your games folder"
+  // prompt), which rewrites ctx.appConfig — the destructured `appConfig` above
+  // is a snapshot from app start and would still show no gameFolder.
+  const liveConfig = ctx.appConfig || appConfig || {};
+  const destinationFormat =
+    libraryFormat ||
+    liveConfig?.Library?.libraryFolderStructure ||
+    buildDefaultConfig().Library.libraryFolderStructure;
+  const gamesDir = path.join(dataDir, "games");
+  if (!fs.existsSync(gamesDir)) fs.mkdirSync(gamesDir, { recursive: true });
+
+  const total = games.length;
+  let progress = 0;
+  const session = {
+    cancelRequested: false,
+    progress,
+    total,
+    cleanupPaths: [],
+    currentExtractionWorker: null,
+  };
+  ctx.activeImportSession = session;
+
+  if (total === 0) {
+    mainWindow.webContents.send("import-progress", {
+      text: "No importable games selected",
+      progress,
+      total,
+    });
+    mainWindow.webContents.send("import-complete");
+    ctx.activeImportSession = null;
+    return [];
+  }
+
+  mainWindow.webContents.send("import-progress", {
+    text: `Starting import of ${total} games...`,
+    progress: 0,
+    total,
+    canCancel: true,
+  });
+
+  const importNeedsLibrary = games.some((game) => game.isArchive || (moveFoldersToLibrary && !isSteamImportRow(game)));
+  let targetLibrary = liveConfig?.Library?.gameFolder;
+  if ((!targetLibrary || !fs.existsSync(targetLibrary)) && importNeedsLibrary) {
+    console.warn("No default library folder configured");
+    mainWindow.webContents.send("import-progress", {
+      text: "Choose a library folder to continue",
+      progress,
+      total,
+      canCancel: false,
+    });
+    ctx.activeImportSession = null;
+    return { success: false, error: "Default library folder is not set" };
+  }
+  if (!targetLibrary || !fs.existsSync(targetLibrary)) targetLibrary = null;
+
+  // Everything that can still bounce the user back to the wizard (missing games
+  // folder, nothing importable) has now passed, so the import is committed.
+  // Close the wizard here rather than in the renderer: the renderer only closed
+  // itself on a fully successful run, which left the window sitting open behind
+  // the progress bar whenever anything failed. Progress and failures are
+  // reported to the main window from here on.
+  closeImporterWindow();
+
+  // ────────────────────────────────────────────────────────────────
+  //  Resolve 7-Zip once before archive extraction
+  // ────────────────────────────────────────────────────────────────
+  let sevenZipPath = null;
+  let sevenZipSource = null;
+
+  const needsExtraction = games.some((g) => g.isArchive === true);
+
+  if (needsExtraction) {
+    const resolvedSevenZip = await resolveSevenZipExecutablePath({
+      configuredPath: liveConfig?.Library?.sevenZipPath,
+      currentConfig: liveConfig,
+      currentConfigPath: configPath,
+      ownerWindow: mainWindow,
+      notify: (text) =>
+        mainWindow.webContents.send("import-progress", {
+          text,
+          progress: 0,
+          total: 0,
+        }),
+    });
+
+    if (!resolvedSevenZip?.path) {
+      throw new Error(
+        "7-Zip executable not found. Bundled 7zip was unavailable and no local 7-Zip installation could be detected.",
+      );
+    }
+
+    sevenZipPath = resolvedSevenZip.path;
+    sevenZipSource = resolvedSevenZip.source;
+
+  }
+
+  const results = [];
+  const deferredSizeJobs = [];
+
+  for (const game of games) {
+    try {
+      throwIfImportCanceled(session);
+      session.cleanupPaths = [];
+      session.progress = progress;
+      mainWindow.webContents.send("import-progress", {
+        text: `Processing ${game.title} (${progress + 1}/${total})`,
+        progress,
+        total,
+        canCancel: true,
+      });
+
+      game.version = normalizeVersionName(game.version);
+      const steamImport = isSteamImportRow(game);
+      const steamId = getSteamIdFromGame(game);
+      const gogImport = isGogImportRow(game);
+      const gogId = getGogIdFromGame(game);
+      let gamePath = game.folder;
+      let execPath = (steamImport || gogImport)
+        ? game.execPath || game.exec_path || ""
+        : game.selectedValue
+        ? path.join(game.folder, game.selectedValue)
+        : "";
+      const sourceCleanupRoot = game.sourceRoot || sourceRoot;
+
+      let archiveToDeleteAfterImport = null;
+
+      // ── Structured move (non-archive) ───────────────────────────────────────
+      // `game.externalState` marks a row that came from another library manager:
+      // it is already installed wherever that tool put it, so it is never moved.
+      // The `game.folder` test covers metadata-only rows (tracked but not
+      // installed), which have no source path to move from.
+      // `game.isScanRoot` marks the row the scanner emits when the scan folder
+      // ITSELF held loose launchables: its `folder` is the scan root, which is
+      // frequently the library root. Moving or deleting that is never what the
+      // user meant, so such a row is imported strictly in place.
+      if (moveFoldersToLibrary && targetLibrary && !game.isArchive && !steamImport && !gogImport && !game.externalState && !game.isScanRoot && game.folder) {
+        let destinationPath = buildStructuredImportPath(
+          targetLibrary,
+          destinationFormat,
+          game,
+        );
+        if (fs.existsSync(destinationPath)) {
+          destinationPath = getUniquePath(destinationPath);
+        }
+
+        const originalSourcePath = gamePath;
+        await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
+        mainWindow.webContents.send("import-progress", {
+          text: `Moving ${game.title} to library...`,
+          progress,
+          total,
+          canCancel: true,
+        });
+
+        try {
+          await fsp.rename(gamePath, destinationPath);
+        } catch (moveErr) {
+          if (moveErr.code !== "EXDEV") throw moveErr;
+          await fsp.cp(gamePath, destinationPath, { recursive: true });
+          const deleteResult = await deletePathWithElevationFallback(gamePath, {
+            recursive: true,
+            force: true,
+            containmentRoot: sourceCleanupRoot,
+            description: `Delete original source folder for ${game.title}`,
+            window: mainWindow,
+            validatePath: (candidatePath) =>
+              validateSourceCleanupPath(candidatePath, sourceCleanupRoot),
+            onProgress: (text) =>
+              mainWindow.webContents.send("import-progress", {
+                text,
+                progress,
+                total,
+                canCancel: true,
+              }),
+          });
+          if (!deleteResult.success) {
+            throw new Error(`Moved copy was created, but source cleanup failed: ${deleteResult.error || "permission denied"}`);
+          }
+        }
+        await removeEmptyParentDirectories(originalSourcePath, sourceCleanupRoot);
+
+        const selectedValue = game.selectedValue || "";
+        gamePath = destinationPath;
+        execPath = selectedValue ? path.join(gamePath, selectedValue) : "";
+      }
+
+      // ── Archive extraction ───────────────────────────────────────
+      if (game.isArchive) {
+        if (!sevenZipPath) {
+          throw new Error("7-Zip is required for archive extraction");
+        }
+
+        const archiveFilename =
+          game.executables?.[0]?.value || game.executables?.[0]?.key;
+        if (!archiveFilename) {
+          throw new Error("No archive file specified");
+        }
+
+        const zipPath = resolveArchivePathForImport(game, archiveFilename);
+
+        let extractPath = buildStructuredImportPath(
+          targetLibrary,
+          destinationFormat,
+          game,
+        );
+        if (fs.existsSync(extractPath)) {
+          const originalPath = extractPath;
+          extractPath = getUniquePath(extractPath);
+          mainWindow.webContents.send("import-progress", {
+            text: `Target exists. Extracting ${game.title} to ${path.basename(extractPath)} instead of overwriting.`,
+            progress,
+            total,
+            canCancel: true,
+          });
+          console.log(`Archive target exists: ${originalPath}. Using ${extractPath}`);
+        }
+
+        mainWindow.webContents.send("import-progress", {
+          text: `Preparing extraction for ${game.title}...`,
+          progress: 0,
+          total: 100,
+          phase: "extracting",
+          title: game.title || null,
+          percent: 0,
+        });
+
+        try {
+          const extraction = await extractArchiveWithFallback({
+            archivePath: zipPath,
+            finalPath: extractPath,
+            containmentRoot: targetLibrary,
+            sevenZipBin: sevenZipPath,
+            session,
+            progressWindow: mainWindow,
+            useBundledRarExtractor:
+              isRarArchivePath(zipPath) && sevenZipSource === "bundled",
+            currentConfig: liveConfig,
+            currentConfigPath: configPath,
+            ownerWindow: mainWindow,
+            notify: (text) =>
+              mainWindow.webContents.send("import-progress", {
+                text,
+                progress: 0,
+                total: 0,
+                title: game.title || null,
+              }),
+            label: game.title || "",
+          });
+          extractPath = extraction.finalPath || extractPath;
+          session.cleanupPaths = [extractPath];
+          archiveToDeleteAfterImport = shouldDeleteSourceArchive ? zipPath : null;
+          auditImportCleanup("archive-extracted", {
+            title: game.title,
+            sourceArchive: zipPath,
+            sourceCleanupRoot,
+            archiveExists: fs.existsSync(zipPath),
+            scheduledForDeletion: Boolean(archiveToDeleteAfterImport),
+          });
+
+          mainWindow?.webContents.send("import-progress", {
+            text: `Extraction complete — 100% (${game.title})`,
+            progress: 100,
+            total: 100,
+          });
+
+          if (!archiveToDeleteAfterImport) {
+            mainWindow?.webContents.send("import-progress", {
+              text: `Kept original archive (${game.title})`,
+              progress: 100,
+              total: 100,
+              canCancel: true,
+            });
+          }
+        } catch (err) {
+          throw err;
+        }
+
+        gamePath = extractPath;
+
+        // ── Find executables after extraction ────────────────────────────────
+        const { findExecutables } = require("../scanners/executableScanner");
+        let execs = await findExecutables(extractPath, gameExt);
+
+        // Clean up common unwanted root-level folders
+        const foldersToRemove = ["__MACOSX", "__LINUX"];
+        for (const folderName of foldersToRemove) {
+          const target = path.join(extractPath, folderName);
+          try {
+            const stat = await fsp.stat(target).catch(() => null);
+            if (stat && stat.isDirectory()) {
+              console.log(`Removing unwanted folder: ${folderName}`);
+              await deletePathWithElevationFallback(target, {
+                recursive: true,
+                force: true,
+                containmentRoot: extractPath,
+                description: `Delete extracted ${folderName} folder`,
+                window: mainWindow,
+                validatePath: (candidatePath) => {
+                  if (!isPathInside(extractPath, candidatePath)) {
+                    throw new Error("Refusing to delete outside the extraction folder");
+                  }
+                },
+              });
+            }
+          } catch (err) {
+            console.warn(`Failed to remove ${folderName}: ${err.message}`);
+          }
+        }
+
+        // Handle common single-subfolder case (flatten nested root)
+        const items = await fsp.readdir(extractPath, { withFileTypes: true });
+        const dirs = items.filter((i) => i.isDirectory());
+        const files = items.filter((i) => i.isFile());
+
+        if (dirs.length === 1 && files.length === 0) {
+          const subPath = path.join(extractPath, dirs[0].name);
+          const subItems = await fsp.readdir(subPath);
+          for (const item of subItems) {
+            await fsp.rename(
+              path.join(subPath, item),
+              path.join(extractPath, item),
+            );
+          }
+          try {
+            await fsp.rmdir(subPath);
+          } catch {}
+
+          // Re-scan executables after flattening
+          execs = await findExecutables(extractPath, gameExt);
+        }
+
+        // ── Executable selection ─────────────────────────────────────────────
+        let selectedExec = null;
+        if (execs.length === 0) {
+          mainWindow.webContents.send("import-progress", {
+            text: `Extracted ${game.title} – no executables found`,
+            progress,
+            total,
+          });
+          game.selectedValue = null;
+          execPath = null;
+        } else if (execs.length === 1) {
+          selectedExec = execs[0];
+          console.log(`Auto-selected single executable for ${game.title}: ${selectedExec}`);
+          mainWindow.webContents.send("import-progress", {
+            text: `Using single executable: ${selectedExec}`,
+            progress: 100,
+            total: 100,
+          });
+        } else {
+          selectedExec = await new Promise((resolve) => {
+            let settled = false;
+            const finish = (value) => {
+              if (settled) return;
+              settled = true;
+              ipcMain.removeAllListeners("executable-chosen");
+              resolve(value);
+            };
+            ipcMain.once("executable-chosen", (event, data) =>
+              finish(data?.selectedExecutable || null),
+            );
+            showExecutableChooser(game.title, game.version || "", execs);
+            // Read through ctx: the window is created inside the call above, so
+            // any reference captured before it would still be null.
+            const chooserWindow = ctx.executableChooserWindow;
+            if (!chooserWindow || chooserWindow.isDestroyed()) {
+              console.error(
+                "Executable chooser window failed to open; skipping selection.",
+              );
+              finish(null);
+              return;
+            }
+            chooserWindow.on("closed", () => finish(null));
+          });
+
+          if (!selectedExec) {
+            await removePathIfExists(extractPath, targetLibrary);
+            session.cleanupPaths = [];
+            mainWindow.webContents.send("import-progress", {
+              text: `Skipped ${game.title} – no executable selected`,
+              progress,
+              total,
+            });
+            continue;
+          }
+        }
+
+        if (selectedExec) {
+          execPath = path.join(extractPath, selectedExec);
+          game.selectedValue = selectedExec;
+          console.log(execs);
+          console.log(execPath);
+          game.executables = execs.map((e) => ({ key: e, value: e }));
+        }
+      }
+
+      const add = {
+        title: game.title,
+        creator: game.creator,
+        engine: game.engine,
+        description: game.description || "Imported game",
+      };
+
+      console.log("Adding Game");
+      throwIfImportCanceled(session);
+      const shouldUpsertExisting = forceReimport;
+      // A replace attaches a new version to an EXISTING record and removes the old
+      // one. It must resolve to that record regardless of forceReimport — the old
+      // code left recordId null when forceReimport was off, so addGame() below
+      // created a duplicate title and the replacement then found nothing to delete.
+      const isReplaceOperation = Boolean(String(game.replaceVersion || "").trim());
+      let recordId =
+        (shouldUpsertExisting || isReplaceOperation) && game.existingRecordId
+          ? game.existingRecordId
+          : shouldUpsertExisting || isReplaceOperation
+            ? await findExistingRecordForImport(game)
+            : null;
+
+      // Steam merge: if this install's appid already belongs to a record (a
+      // prior steam import, or an Atlas/f95 title listing this appid in its
+      // external_ids), attach to that record so it shows as an extra version
+      // instead of a duplicate title — even when the names differ.
+      if (!recordId && steamId) {
+        const steamMergeRecordId =
+          (game.existingRecordId &&
+          ["steamVersion", "repairPath"].includes(String(game.scanStatus || ""))
+            ? game.existingRecordId
+            : null) || (await findRecordBySteamId(steamId));
+        if (steamMergeRecordId) recordId = steamMergeRecordId;
+      }
+
+      // GOG merge: mirror the Steam behavior above for GOG product ids.
+      if (!recordId && gogId) {
+        const gogMergeRecordId =
+          (game.existingRecordId &&
+          ["gogVersion", "repairPath"].includes(String(game.scanStatus || ""))
+            ? game.existingRecordId
+            : null) || (await findRecordByGogId(gogId));
+        if (gogMergeRecordId) recordId = gogMergeRecordId;
+      }
+
+      // Safety net: a replace whose existing record can't be resolved must NOT
+      // fall through to addGame() (that is exactly what produced duplicate
+      // titles). Skip it with a clear message instead.
+      if (isReplaceOperation && !recordId) {
+        console.warn(`Skipping replace for '${game.title}': existing record not found`);
+        results.push({
+          success: false,
+          skipped: true,
+          error: "Could not find the existing game to replace",
+        });
+        progress++;
+        session.progress = progress;
+        mainWindow.webContents.send("import-progress", {
+          text: `Skipped replace for '${game.title}' ${progress}/${total}: existing game not found`,
+          progress,
+          total,
+          canCancel: true,
+        });
+        continue;
+      }
+
+      if (game.scanStatus === "alreadyImported" && !recordId) {
+        console.warn(
+          `Skipping already imported row without resolvable record: ${game.title}`,
+        );
+        results.push({
+          success: false,
+          skipped: true,
+          error: "Existing record could not be resolved",
+        });
+        progress++;
+        session.progress = progress;
+        mainWindow.webContents.send("import-progress", {
+          text: `Skipped existing game '${game.title}' ${progress}/${total}: record could not be resolved`,
+          progress,
+          total,
+          canCancel: true,
+        });
+        continue;
+      }
+      if (!recordId) {
+        recordId = await addGame(add);
+      }
+      console.log("game added");
+      console.log("adding version");
+      const versionGame = {
+        ...game,
+        folder: gamePath,
+        execPath,
+        folderSize: game.folderSize || game.folder_size || null,
+        deferFolderSizeCalculation: true,
+        in_place: (steamImport || gogImport) ? 1 : game.in_place,
+        inPlace: (steamImport || gogImport) ? true : game.inPlace || (!game.isArchive && !moveFoldersToLibrary),
+        sourceType: steamImport ? "steam" : gogImport ? "gog" : game.sourceType,
+        steamId: steamId || game.steamId,
+        gogId: gogId || game.gogId,
+      };
+      let bulkReplaceRow = null;
+      let bulkReplacePathAllowed = null;
+      if (isReplaceOperation) {
+        const selectedVersionId = Number.parseInt(game.replaceVersionId, 10);
+        bulkReplaceRow = Number.isInteger(selectedVersionId) && selectedVersionId > 0
+          ? await dbGet(
+              db,
+              `SELECT rowid AS version_id, record_id, version, game_path, exec_path
+               FROM versions WHERE rowid = ? AND record_id = ? LIMIT 1`,
+              [selectedVersionId, recordId],
+            )
+          : await getVersionForRecord(recordId, game.replaceVersion);
+        if (!bulkReplaceRow) {
+          throw new Error(`Selected replacement version ${game.replaceVersion} was not found`);
+        }
+        bulkReplacePathAllowed = bulkReplaceRow.game_path
+          ? await isAllowedDeletionPath(
+              recordId,
+              path.resolve(bulkReplaceRow.game_path),
+              ctx.appConfig?.Library?.gameFolder,
+            )
+          : false;
+      }
+      let savedVersionResult = null;
+      if (bulkReplaceRow) {
+        savedVersionResult = await updateVersion(
+          {
+            ...versionGame,
+            version_id: bulkReplaceRow.version_id,
+            previousVersion: bulkReplaceRow.version,
+            version: game.version,
+            game_path: gamePath,
+            exec_path: execPath,
+          },
+          recordId,
+        );
+      } else if (shouldUpsertExisting) {
+        savedVersionResult = await upsertVersion(versionGame, recordId);
+      } else {
+        savedVersionResult = await addVersion(versionGame, recordId);
+      }
+      const savedVersion = savedVersionResult?.version || game.version;
+      if (!Number(game.folderSize || game.folder_size || 0) && gamePath) {
+        deferredSizeJobs.push({
+          recordId,
+          version: savedVersion,
+          gamePath,
+          title: game.title,
+        });
+      }
+      console.log("added version");
+      console.log("adding mapping");
+      console.log("recordId:", recordId, "atlasId:", game.atlasId);
+      if (game.atlasId) {
+        try {
+          await addAtlasMapping(recordId, game.atlasId);
+          console.log("mapping added");
+        } catch (err) {
+          console.error("Failed to add atlas mapping:", err);
+          throw err;
+        }
+      }
+      if (game.f95Id) {
+        try {
+          await dbRun(
+            db,
+            `INSERT INTO f95_zone_mappings (record_id, f95_id)
+             SELECT ?, ?
+             WHERE NOT EXISTS (
+               SELECT 1 FROM f95_zone_mappings WHERE record_id = ? AND f95_id = ?
+             )`,
+            [recordId, game.f95Id, recordId, game.f95Id],
+          );
+          console.log("f95 mapping added");
+        } catch (err) {
+          console.error("Failed to add F95 mapping:", err);
+          throw err;
+        }
+      }
+      const lcId = getLewdCornerIdFromGame(game);
+      if (lcId) {
+        try {
+          await addLewdCornerMapping(recordId, lcId);
+          console.log("lewdcorner mapping added");
+        } catch (err) {
+          console.error("Failed to add LewdCorner mapping:", err);
+          throw err;
+        }
+      }
+
+      // Steam-sourced rows carry a numeric appid. Persisting the mapping is what
+      // wires up launch (steam://run via getSteamIDbyRecord) and the Steam CDN
+      // banner/hero art resolved in mediaSources. Metadata enrichment of
+      // steam_data happens in a later phase; the mapping alone is enough for the
+      // game to appear, render art, and launch.
+      if (steamId) {
+        try {
+          await addSteamMapping(recordId, steamId);
+          console.log("steam mapping added");
+        } catch (err) {
+          console.error("Failed to add steam mapping:", err);
+          throw err;
+        }
+      }
+
+      // GOG-sourced rows carry a numeric product id. The mapping wires up
+      // launch, CDN art (mediaSources gogImages), and browse/detail rendering.
+      if (gogId) {
+        try {
+          await addGogMapping(recordId, gogId);
+          console.log("gog mapping added");
+        } catch (err) {
+          console.error("Failed to add gog mapping:", err);
+          throw err;
+        }
+      }
+
+      // External library (F95Checker etc): the user's own data — notes, rating,
+      // last played, finished, labels, tab. Runs here because it is keyed on the
+      // saved version and needs the mappings in place. Never fatal: a failure to
+      // copy a note must not roll back an otherwise good import.
+      if (game.externalState) {
+        try {
+          const stateResult = await applyExternalLibraryState({
+            recordId,
+            savedVersion,
+            state: game.externalState,
+            resolveCollection: resolveExternalCollection,
+            options: externalLibraryOptions,
+          });
+          if (stateResult?.warnings?.length) {
+            externalStateWarnings.push({ title: game.title, warnings: stateResult.warnings });
+          }
+        } catch (stateErr) {
+          console.warn(
+            `Failed to apply external library state for '${game.title}':`,
+            stateErr.message,
+          );
+          externalStateWarnings.push({ title: game.title, warnings: ["apply-failed"] });
+        }
+      }
+
+      if (game.replaceVersion) {
+        const replacementResult = await replaceInstalledVersionAfterImport({
+          recordId,
+          newVersion: savedVersion,
+          newGamePath: gamePath,
+          replaceVersion: game.replaceVersion,
+          replaceVersionId: game.replaceVersionId,
+          oldVersionSnapshot: bulkReplaceRow,
+          trustedOldPath: bulkReplacePathAllowed,
+          deleteDatabaseRow: false,
+          libraryRoot: ctx.appConfig?.Library?.gameFolder || null,
+          auditDataDir: dataDir,
+          sender: mainWindow,
+        });
+
+        if (replacementResult?.skipped) {
+          throw new Error(
+            `Imported ${game.title}, but could not remove selected version ${game.replaceVersion}: ${replacementResult.reason}`,
+          );
+        }
+      }
+      if (archiveToDeleteAfterImport) {
+        try {
+          const deleteResult = await deletePathWithElevationFallback(archiveToDeleteAfterImport, {
+            recursive: false,
+            force: true,
+            containmentRoot: sourceCleanupRoot,
+            description: `Delete original archive for ${game.title}`,
+            window: mainWindow,
+            validatePath: (candidatePath) =>
+              validateSourceCleanupPath(candidatePath, sourceCleanupRoot),
+            onProgress: (text) =>
+              mainWindow.webContents.send("import-progress", {
+                text,
+                progress,
+                total,
+                canCancel: true,
+              }),
+          });
+          auditImportCleanup("source-archive-delete-result", {
+            title: game.title,
+            sourceArchive: archiveToDeleteAfterImport,
+            sourceCleanupRoot,
+            deleteResult,
+            existsAfterDelete: fs.existsSync(archiveToDeleteAfterImport),
+          });
+          if (!deleteResult.success) {
+            throw new Error(deleteResult.error || "Archive delete skipped");
+          }
+          await removeEmptyParentDirectories(archiveToDeleteAfterImport, sourceCleanupRoot);
+          console.log(`Deleted archive after successful import: ${archiveToDeleteAfterImport}`);
+          mainWindow.webContents.send("import-progress", {
+            text: deleteResult.elevated
+              ? `Deleted original archive with administrator approval after importing ${game.title}`
+              : `Deleted original archive after importing ${game.title}`,
+            progress,
+            total,
+            canCancel: true,
+          });
+        } catch (archiveDeleteErr) {
+          auditImportCleanup("source-archive-delete-failed", {
+            title: game.title,
+            sourceArchive: archiveToDeleteAfterImport,
+            sourceCleanupRoot,
+            error: archiveDeleteErr.message || String(archiveDeleteErr),
+            existsAfterDelete: fs.existsSync(archiveToDeleteAfterImport),
+          });
+          console.warn(
+            `Failed to delete archive ${archiveToDeleteAfterImport}: ${archiveDeleteErr.message}`,
+          );
+          throw new Error(
+            `Imported ${game.title}, but could not delete source archive ${archiveToDeleteAfterImport}: ${archiveDeleteErr.message}`,
+          );
+        }
+      }
+      results.push({
+        success: true,
+        title: game.title,
+        recordId,
+        atlasId: game.atlasId,
+        steamId: steamId || game.steamId,
+        gogId: gogId || game.gogId,
+        version: savedVersion,
+      });
+      session.cleanupPaths = [];
+
+      progress++;
+      session.progress = progress;
+      mainWindow.webContents.send("import-progress", {
+        text: `Imported game '${game.title}' ${progress}/${total}`,
+        progress,
+        total,
+        canCancel: true,
+      });
+      mainWindow.webContents.send("game-imported", recordId);
+      mainWindow.webContents.send("game-updated", recordId);
+    } catch (err) {
+      if (isImportCancelledError(err)) {
+        await Promise.all(
+          [...session.cleanupPaths].reverse().map((targetPath) =>
+            removePathIfExists(targetPath, targetLibrary),
+          ),
+        );
+        session.cleanupPaths = [];
+        mainWindow.webContents.send("import-progress", {
+          text: `Import canceled. Kept ${results.filter((r) => r.success).length} completed game(s).`,
+          progress,
+          total,
+          canceled: true,
+          canCancel: false,
+        });
+        break;
+      }
+      console.error("Error importing game:", err);
+      results.push({ success: false, error: err.message });
+      progress++;
+      session.progress = progress;
+      mainWindow.webContents.send("import-progress", {
+        text: `Error importing game '${game.title}' ${progress}/${total}: ${err.message}`,
+        progress,
+        total,
+        canCancel: true,
+      });
+    }
+  }
+
+  if (session.cancelRequested) {
+    mainWindow.webContents.send("import-complete");
+    ctx.activeImportSession = null;
+    return results;
+  }
+
+  mainWindow.webContents.send("import-progress", {
+    text: `Game import complete: ${results.filter((r) => r.success).length} successful`,
+    progress,
+    total,
+    canCancel: false,
+  });
+
+  // The wizard was closed when the import started, so per-game failures can no
+  // longer be alerted there. Hand them to the main window's toast system.
+  const importFailures = results.filter((r) => r && r.success === false);
+  if (importFailures.length > 0) {
+    mainWindow.webContents.send("import-failed", {
+      count: importFailures.length,
+      total,
+      errors: importFailures
+        .map((r) => r.error || r.title || "Unknown import failure")
+        .slice(0, 5),
+    });
+  }
+
+  const shouldDownloadImportImages = downloadBannerImages || downloadPreviewImages;
+
+  // Enrich imported Steam games in the background so the import itself never
+  // blocks on per-game network calls. Only touches games actually imported,
+  // throttled gently, emitting game-updated as each row's metadata lands.
+  const steamToEnrich = results.filter((r) => r.success && r.steamId);
+  if (steamToEnrich.length > 0 && !shouldDownloadImportImages) {
+    ;(async () => {
+      for (const r of steamToEnrich) {
+        try {
+          await fetchAndStoreSteamData(null, r.steamId, ctx.appConfig?.Metadata?.steamAssetSourceOrder);
+          mainWindow?.webContents?.send("game-updated", r.recordId);
+        } catch (err) {
+          console.error(`Background steam enrichment failed for ${r.steamId}:`, err);
+        }
+        await new Promise((res) => setTimeout(res, 800));
+      }
+    })();
+  }
+
+  // GOG equivalent of the Steam background enrichment above.
+  const gogToEnrich = results.filter((r) => r.success && r.gogId);
+  if (gogToEnrich.length > 0 && !shouldDownloadImportImages) {
+    ;(async () => {
+      for (const r of gogToEnrich) {
+        try {
+          await fetchAndStoreGogData(null, r.gogId);
+          mainWindow?.webContents?.send("game-updated", r.recordId);
+        } catch (err) {
+          console.error(`Background gog enrichment failed for ${r.gogId}:`, err);
+        }
+        await new Promise((res) => setTimeout(res, 800));
+      }
+    })();
+  }
+
+  // Phase 2: Image downloads
+  // Image downloads run in the BACKGROUND so the importer window can close as
+  // soon as the DB records exist (matching the deferred-size and Steam/GOG
+  // enrichment pattern). We intentionally do NOT await this before returning —
+  // banners/previews fill in afterwards, each emitting 'game-updated' so the
+  // library refreshes that row. The importer window is likely already closed.
+  const runImageDownloads = async () => {
+  if (shouldDownloadImportImages) {
+    progress = 0;
+    // Shared across the whole import's image phase: once a source is rate-
+    // limited we stop pulling from it and notify, continuing with others.
+    const blockedSources = new Set();
+    const onRateLimited = (source, retryAfterMs) => {
+      try {
+        if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+          mainWindow.webContents.send("media-rate-limited", { source, retryAfterMs });
+        }
+      } catch { /* window may be closed already */ }
+    };
+    const successfulImports = results.filter((r) => r.success && r.recordId);
+    const imageTotal = successfulImports.length;
+    const imageSummary = {
+      processed: 0,
+      downloaded: 0,
+      skipped: 0,
+      failed: 0,
+      filesWritten: 0,
+      dbRowsWritten: 0,
+    };
+    const isVideoUrl = (url) => /\.(mp4|webm|m4v|mpd)(\?|#|$)/i.test(String(url || ""));
+    const inferMediaSource = (url) => {
+      const value = String(url || "").toLowerCase();
+      if (value.includes("steamstatic") || value.includes("akamaihd") || value.includes("steam")) return "steam";
+      if (value.includes("f95")) return "f95";
+      return "metadata";
+    };
+    const resolveImportMediaIdentifiers = async (recordId, importResult) => {
+      const dbAtlasId = await GetAtlasIDbyRecord(recordId);
+      const steamId = await getSteamIDbyRecord(recordId);
+      const gogId = await getGogIDbyRecord(recordId);
+      let f95Id = null;
+      if (dbAtlasId) {
+        try {
+          f95Id = await findF95Id(dbAtlasId);
+        } catch (err) {
+          console.warn(`Image identifier trace: failed to resolve F95 id for atlas ${dbAtlasId}:`, err);
+        }
+      }
+      return {
+        recordId,
+        resultAtlasId: importResult.atlasId || null,
+        dbAtlasId,
+        f95Id,
+        steamId,
+        gogId,
+      };
+    };
+    const sendImageTrace = (trace) => {
+      const message = [
+        `Images trace '${trace.title}'`,
+        `recordId=${trace.recordId}`,
+        `resultAtlasId=${trace.resultAtlasId || "none"}`,
+        `dbAtlasId=${trace.dbAtlasId || "none"}`,
+        `f95Id=${trace.f95Id || "none"}`,
+        `steamId=${trace.steamId || "none"}`,
+        `banner=${trace.downloadBannerImages} previews=${trace.downloadPreviewImages} limit=${trace.previewLimit} videos=${trace.downloadVideos}`,
+        `bannerUrls=${trace.bannerUrlCount}`,
+        `previewUrls=${trace.previewUrlCount}`,
+        `attempts=${trace.attempted || 0}`,
+        `writes=${trace.filesWritten || 0}`,
+        `existing=${trace.filesExisting || 0}`,
+        `dbBanners=${trace.bannerRowsWritten || 0}`,
+        `dbPreviews=${trace.previewRowsWritten || 0}`,
+        `imageDir=${trace.imageDir || "none"}`,
+        trace.reason ? `reason=${trace.reason}` : null,
+      ].filter(Boolean).join(" | ");
+      console.log(message);
+      mainWindow.webContents.send("import-progress", {
+        text: message,
+        progress,
+        total: imageTotal,
+        canCancel: true,
+      });
+    };
+
+    console.log(
+      `Import image flags | banner=${downloadBannerImages} previews=${downloadPreviewImages} ` +
+      `limit=${previewLimit} videos=${downloadVideos} importedRows=${games.length} successfulImports=${successfulImports.length}`,
+    );
+    mainWindow.webContents.send("import-progress", {
+      text:
+        `Image flags: banner=${downloadBannerImages}, previews=${downloadPreviewImages}, ` +
+        `limit=${previewLimit}, videos=${downloadVideos}, successful imports=${successfulImports.length}`,
+      progress,
+      total: imageTotal,
+      canCancel: true,
+    });
+
+    if (imageTotal === 0) {
+      mainWindow.webContents.send("import-progress", {
+        text: "Image download skipped: no successful imports with record IDs",
+        progress: 0,
+        total: 0,
+        canCancel: false,
+      });
+    }
+
+    if (imageTotal > 0) {
+      mainWindow.webContents.send("import-progress", {
+        text: `Starting image download for ${imageTotal} imported games...`,
+        progress,
+        total: imageTotal,
+        canCancel: true,
+      });
+    }
+
+    const hostLimiter = createHostLimiter();
+    const processImportedGameImages = async (importedGame) => {
+      const title =
+        importedGame.title ||
+        games.find((g) => g.atlasId === importedGame.atlasId || g.steamId === importedGame.steamId)?.title ||
+        "Imported game";
+      try {
+        throwIfImportCanceled(session);
+
+        const recordId = importedGame.recordId;
+        const ids = await resolveImportMediaIdentifiers(recordId, importedGame);
+        const { dbAtlasId, f95Id, steamId, gogId } = ids;
+
+        if (steamId) {
+          try {
+            await fetchAndStoreSteamData(null, steamId, ctx.appConfig?.Metadata?.steamAssetSourceOrder);
+          } catch (steamErr) {
+            console.warn(`Import media trace: Steam metadata refresh failed for ${steamId}:`, steamErr);
+          }
+        }
+
+        if (gogId) {
+          try {
+            await fetchAndStoreGogData(null, gogId);
+          } catch (gogErr) {
+            console.warn(`Import media trace: GOG metadata refresh failed for ${gogId}:`, gogErr);
+          }
+        }
+
+        if (!dbAtlasId && !steamId && !gogId) {
+          progress++;
+          imageSummary.processed++;
+          imageSummary.skipped++;
+          sendImageTrace({
+            title,
+            downloadBannerImages,
+            downloadPreviewImages,
+            downloadVideos,
+            previewLimit,
+            ...ids,
+            bannerUrlCount: 0,
+            previewUrlCount: 0,
+            imageDir: path.join(dataDir, "images", recordId.toString()),
+            reason: "skipped: no Atlas/F95/Steam mapping",
+          });
+          return;
+        }
+
+        const currentMediaSettings = getMediaPerformanceSettings(ctx.appConfig || appConfig);
+        const sourceOrder = getMetadataSourceOrder();
+        const bannerUrl = downloadBannerImages ? await getRemoteBannerUrl(recordId, { sourceOrder }) : "";
+        const rawPreviewUrls = downloadPreviewImages ? await getRemotePreviewUrls(recordId, { sourceOrder }) : [];
+        const screenUrls = rawPreviewUrls
+          .map((url) => String(url || "").trim())
+          .filter(Boolean)
+          .filter((url) => downloadVideos || !isVideoUrl(url))
+          .map((url) => ({ url, source: inferMediaSource(url) }));
+        const previewCount = downloadPreviewImages
+          ? previewLimit === "Unlimited"
+            ? screenUrls.length
+            : Math.min(parseInt(previewLimit), screenUrls.length)
+          : 0;
+        const additionalAssets = (downloadBannerImages || downloadPreviewImages)
+          ? (await getAllDownloadableAssetUrlsForRecord(recordId, { downloadVideos, sourceOrder }))
+              .filter((asset) => asset.targetKind !== "preview" && asset.url !== bannerUrl)
+          : [];
+        const totalImages =
+          (downloadBannerImages && bannerUrl ? 2 : 0) + previewCount + additionalAssets.length;
+
+        if (!bannerUrl && previewCount === 0 && additionalAssets.length === 0) {
+          progress++;
+          imageSummary.processed++;
+          imageSummary.skipped++;
+          sendImageTrace({
+            title,
+            downloadBannerImages,
+            downloadPreviewImages,
+            downloadVideos,
+            previewLimit,
+            ...ids,
+            bannerUrlCount: bannerUrl ? 1 : 0,
+            previewUrlCount: screenUrls.length,
+            mediaAssetUrlCount: additionalAssets.length,
+            imageDir: path.join(dataDir, "images", recordId.toString()),
+            reason: "skipped: no banner/preview/media asset URLs found",
+          });
+          return;
+        }
+
+        const primaryHost =
+          getUrlHost(bannerUrl) ||
+          getUrlHost(screenUrls[0]?.url) ||
+          getUrlHost(additionalAssets[0]?.url);
+        const releaseHostSlot = await hostLimiter.waitForHostSlot(
+          primaryHost,
+          currentMediaSettings.mediaPerHostConcurrency,
+        );
+
+        mainWindow.webContents.send("import-progress", {
+          text: `Downloading images for '${title}', 0/${totalImages}`,
+          progress,
+          total: imageTotal,
+          canCancel: true,
+        });
+
+        let downloadResult;
+        try {
+          downloadResult = await downloadImages(
+            recordId,
+            dbAtlasId || steamId || recordId,
+            (current, totalImages) => {
+              mainWindow.webContents.send("import-progress", {
+                text: `Downloading images for '${title}', ${current}/${totalImages}`,
+                progress,
+                total: imageTotal,
+                canCancel: true,
+              });
+            },
+            downloadBannerImages,
+            downloadPreviewImages,
+            previewLimit,
+            downloadVideos,
+            dataDir,
+            async () => bannerUrl,
+            async () => screenUrls,
+            updateBanners,
+            updatePreviews,
+            {
+              source: inferMediaSource(bannerUrl),
+              additionalAssets,
+              upsertMediaAsset,
+              requestDelayMs: currentMediaSettings.mediaRequestDelayMs,
+              blockedSources,
+              onRateLimited,
+            },
+          );
+        } finally {
+          releaseHostSlot();
+        }
+        throwIfImportCanceled(session);
+
+        mainWindow.webContents.send("game-updated", recordId);
+
+        progress++;
+        imageSummary.processed++;
+        imageSummary.filesWritten += downloadResult.filesWritten || 0;
+        imageSummary.dbRowsWritten +=
+          (downloadResult.bannerRowsWritten || 0) +
+          (downloadResult.previewRowsWritten || 0) +
+          (downloadResult.mediaAssetRowsWritten || 0);
+        const urlCount =
+          downloadResult.bannerUrlCount +
+          downloadResult.previewUrlCount +
+          downloadResult.mediaAssetUrlCount;
+        const failedWithUrls = urlCount > 0 && downloadResult.downloaded === 0 && downloadResult.errors.length > 0;
+        if (failedWithUrls || !downloadResult.success) imageSummary.failed++;
+        else if ((downloadResult.filesWritten || 0) > 0 || (downloadResult.filesExisting || 0) > 0) imageSummary.downloaded++;
+        else imageSummary.skipped++;
+        const statusText = downloadResult.success && !failedWithUrls
+          ? `Downloaded images for '${title}': ${downloadResult.filesWritten} file(s) written, ${downloadResult.attempted} attempted`
+          : `Image download failed for '${title}': ${downloadResult.filesWritten} file(s) written, ${downloadResult.attempted} attempted, first error: ${downloadResult.errors[0] || "unknown"}`;
+        mainWindow.webContents.send("import-progress", {
+          text: statusText,
+          progress,
+          total: imageTotal,
+          canCancel: true,
+        });
+        sendImageTrace({
+          title,
+          downloadBannerImages,
+          downloadPreviewImages,
+          downloadVideos,
+          previewLimit,
+          ...ids,
+          ...downloadResult,
+          reason: downloadResult.errors.length > 0
+            ? downloadResult.errors.join("; ")
+            : ((downloadResult.filesWritten || 0) > 0 || (downloadResult.filesExisting || 0) > 0)
+              ? "downloaded"
+              : "skipped: no local files written",
+        });
+      } catch (err) {
+        if (isImportCancelledError(err)) {
+          mainWindow.webContents.send("import-progress", {
+            text: `Import canceled. Kept ${results.filter((r) => r.success).length} completed game(s).`,
+            progress,
+            total: imageTotal,
+            canceled: true,
+            canCancel: false,
+          });
+          session.cancelRequested = true;
+          return;
+        }
+        console.error("Error downloading images for game:", err);
+        progress++;
+        imageSummary.processed++;
+        imageSummary.failed++;
+        mainWindow.webContents.send("import-progress", {
+          text: `Error downloading images for '${title}' ${progress}/${imageTotal}: ${err.message}`,
+          progress,
+          total: imageTotal,
+          canCancel: true,
+        });
+      }
+    }
+
+    const initialMediaSettings = getMediaPerformanceSettings(ctx.appConfig || appConfig);
+    await runConcurrentQueue(
+      successfulImports,
+      initialMediaSettings.mediaDownloadConcurrency,
+      async (importedGame) => {
+        if (session.cancelRequested) return;
+        await processImportedGameImages(importedGame);
+      },
+    );
+
+    if (!session.cancelRequested && imageTotal > 0) {
+      const zeroFilesMessage = imageSummary.filesWritten === 0
+        ? " Image download phase completed with zero local files written. Check per-row image traces above."
+        : "";
+      mainWindow.webContents.send("import-progress", {
+        text:
+          `Image download phase finished: processed=${imageSummary.processed}, ` +
+          `downloaded=${imageSummary.downloaded}, skipped=${imageSummary.skipped}, ` +
+          `failed=${imageSummary.failed}, filesWritten=${imageSummary.filesWritten}, ` +
+          `dbRows=${imageSummary.dbRowsWritten}.${zeroFilesMessage}`,
+        progress,
+        total: imageTotal,
+        canCancel: false,
+      });
+    }
+  }
+  };
+  // Fire-and-forget; don't block the handler's return on image downloads. When
+  // the background image work finishes it emits a final import-complete so any
+  // late listeners settle, but the importer window has already closed via the
+  // handler returning results below.
+  runImageDownloads()
+    .catch((err) => console.warn("Background image downloads failed:", err?.message || err))
+    .finally(() => {
+      try {
+        if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+          mainWindow.webContents.send("import-images-complete");
+        }
+      } catch (err) {
+        console.warn("Failed to send import-images-complete:", err.message || err);
+      }
+    });
+
+  // Folder-size calculation is deferred and run in the BACKGROUND so the
+  // importer window can close as soon as the DB records exist. We intentionally
+  // do NOT await this loop before returning — sizes fill in afterwards, each
+  // emitting a 'game-updated' so the library refreshes that row. All sends are
+  // guarded because the importer window is likely already closed by now.
+  const runDeferredSizeJobs = async () => {
+    if (session.cancelRequested || deferredSizeJobs.length === 0) return
+    const safeSend = (channel, payload) => {
+      try {
+        if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+          mainWindow.webContents.send(channel, payload)
+        }
+      } catch (err) {
+        console.warn(`Deferred size job: failed to send ${channel}:`, err.message || err)
+      }
+    }
+    for (const job of deferredSizeJobs) {
+      try {
+        const folderSize = await calculatePathSizeSafe(job.gamePath)
+        if (folderSize !== null) {
+          await updateFolderSize(job.recordId, job.version, folderSize)
+          safeSend("game-updated", job.recordId)
+        }
+      } catch (err) {
+        console.warn(`Deferred size calculation failed for ${job.gamePath}:`, err.message || err)
+      }
+    }
+  }
+  // Fire-and-forget; don't block the handler's return on size calculation.
+  runDeferredSizeJobs()
+
+  try {
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents && !mainWindow.webContents.isDestroyed()) {
+      mainWindow.webContents.send("import-complete");
+    }
+  } catch (err) {
+    console.warn("Failed to send import-complete:", err.message || err)
+  }
+  ctx.activeImportSession = null;
+  return results;
+});
+
+ipcMain.handle("start-steam-scan", async (event, params) => {
+  return await startSteamScan(db, params, event);
+});
+
+ipcMain.handle("start-gog-scan", async (event, params) => {
+  return await startGogScan(db, params, event);
+});
+
+ipcMain.handle("select-gog-directory", async () => {
+  console.log("IPC select-gog-directory called");
+  try {
+    const result = await dialog.showOpenDialog({
+      properties: ["openDirectory"],
+      title: "Select GOG Games or Galaxy storage folder",
+      defaultPath: process.platform === "win32" ? "C:\\GOG Games" : undefined,
+    });
+    if (result.canceled) {
+      console.log("User canceled GOG directory selection");
+      return null;
+    }
+    const selectedPath = result.filePaths[0];
+    console.log(`User selected GOG directory: ${selectedPath}`);
+    return selectedPath;
+  } catch (err) {
+    console.error("Error selecting GOG directory:", err);
+    return null;
+  }
+});
+
+ipcMain.handle("select-steam-directory", async () => {
+  console.log("IPC select-steam-directory called");
+  try {
+    const result = await dialog.showOpenDialog({
+      properties: ["openDirectory"],
+      title: "Select Steam Directory",
+      defaultPath: path.join("C:", "Program Files (x86)", "Steam"),
+    });
+    if (result.canceled) {
+      console.log("User canceled Steam directory selection");
+      return null;
+    }
+    const selectedPath = result.filePaths[0];
+    console.log(`User selected Steam directory: ${selectedPath}`);
+    return selectedPath;
+  } catch (err) {
+    console.error("Error selecting Steam directory:", err);
+    return null;
+  }
+});
+
+
+ipcMain.handle(
+  "check-record-exist",
+  async (event, { title, creator, engine, version, path }) => {
+    try {
+      const existsByDetails = await checkRecordExist(
+        title,
+        creator,
+        engine,
+        version,
+        path,
+      );
+      if (existsByDetails) return true;
+      return await checkPathExist(path, title);
+    } catch (err) {
+      console.error("check-record-exist error:", err);
+      return false;
+    }
+  },
+);
+
+
+// ── Install a completed download ────────────────────────────────────────────
+//
+// Lives here rather than in the download manager because extraction needs the
+// importer's context: the resolved 7-Zip binary (including its user-prompt
+// fallback), the live config, and the owning window for progress. Duplicating
+// that elsewhere would mean a second, less-tested extraction path.
+//
+// The user has already confirmed the version in the install modal, so this
+// does not guess. `version` is taken as given.
+// Only one install may run at a time. Extraction is CPU- and disk-bound and each
+// one spawns 7-Zip, so two at once take longer than two in sequence and compete
+// for the same disk. More importantly they can collide: both resolve a target
+// path from the same library layout, both flatten a single wrapped folder, and a
+// replace deletes a directory — concurrent runs against one game could have one
+// deleting what the other just wrote.
+//
+// A module-level flag rather than a queue: the caller is a person clicking
+// Install, so the honest answer to a second click is "one at a time", not a
+// silent backlog that starts minutes later with no indication it is waiting.
+let installInProgress = null;
+
+ipcMain.handle("downloads-install", async (event, { id, version, onComplete, keepArchive = false, replaceVersionId = null } = {}) => {
+  const downloadsDb = require("../db/downloads");
+  const downloadManager = require("../downloads/downloadManager");
+
+  // `step` names where the failure actually happened. Without it every message
+  // is a bare sentence with no way to tell which stage produced it, and a stale
+  // one from an earlier attempt is indistinguishable from a fresh one.
+  // NOT "failed". That is the DOWNLOAD failure state, and the Retry it offers
+  // calls downloadManager.retry(), which deletes the archive from disk and
+  // clears file_path -- correct for a corrupt partial transfer, catastrophic
+  // here, where the archive downloaded fine and only the install stumbled.
+  // Clearing file_path also flips `installable` false, which is why the Install
+  // button vanished and the only way forward was downloading the whole thing
+  // again.
+  //
+  // "install_failed" keeps file_path intact, so the archive stays on disk and
+  // Install stays available.
+  const fail = async (message, step = "install") => {
+    console.log("[downloads-install] failed", JSON.stringify({ downloadId: id, step, message }));
+    await downloadManager.setItemState(id, "install_failed", { error: message });
+    return { success: false, error: message, step };
+  };
+
+  if (installInProgress !== null) {
+    console.log("[downloads-install] refused, already installing", JSON.stringify({
+      requested: id,
+      running: installInProgress,
+    }));
+    return {
+      success: false,
+      busy: true,
+      installingId: installInProgress,
+      error: "Another install is already running. Wait for it to finish, then install this one.",
+    };
+  }
+  installInProgress = id;
+
+  try {
+    // Clear any error left by a previous attempt before doing anything else.
+    // fail() writes its message into the download row and leaves it there, so a
+    // later attempt that failed somewhere else — or was refused by the lock above
+    // without touching the row — still displayed the OLD message. That makes a
+    // failure look like it is happening in a place it is not, which is the worst
+    // possible property for an error to have while diagnosing one.
+    await downloadsDb.updateDownload(id, { error: "" }).catch(() => {});
+
+    const item = await downloadsDb.getDownload(id);
+    if (!item) return { success: false, error: "Download not found" };
+    if (!item.filePath || !fs.existsSync(item.filePath)) {
+      return fail("The downloaded file is missing. Try downloading again.", "missing-file");
+    }
+    // ── Promote a Browse download to a library record ──────────────────────
+    //
+    // A catalog placeholder (`catalog:30956`) is TRUTHY, so this guard used to
+    // let one through and the record lookup below then reported the game as "no
+    // longer in your library" — about a game that had never been in it. Rows
+    // queued before the enqueue normalisation still carry one, so the positive
+    // test stays.
+    //
+    // What changed is what happens next. This used to refuse with "add it to
+    // your library first", which was a limitation dressed up as instructions:
+    // a download IS the game arriving, and requiring a manual add before it can
+    // land is a step with no purpose. The record is created here instead.
+    //
+    // Created at INSTALL and not at enqueue, deliberately. Enqueue-time creation
+    // would show the game in the library the moment the download starts (with
+    // cover art, which is genuinely nicer), but a cancelled or failed download
+    // would leave a record with no versions behind, and nothing cleans those up.
+    let recordId = toLocalRecordId(item.recordId);
+    let promotion = null;
+    if (recordId === null) {
+      const ref = toCatalogRef(item.catalogRef);
+      if (!ref) {
+        // No ref, and two quite different reasons for it.
+        //
+        // The one worth naming is an F95-only title: db/wishlist.js builds
+        // catalog_ref from an entry's atlas / lewdcorner / steam ids, and an
+        // f95_id alone is not one of the kinds library/catalogRef.js knows.
+        // That is not an oversight to be papered over here — every promotion
+        // query in db/catalogEntry.js hydrates from atlas_data, so an F95 thread
+        // with no Atlas entry behind it has nothing to build a record FROM. The
+        // honest remedy is to add the game manually first, and saying "remove it
+        // and start the download again" would send the user round a loop that
+        // ends in exactly this message a second time.
+        //
+        // The other is a row queued before catalog_ref existed, which really
+        // does just need re-queuing. `source` separates them: an F95 download
+        // that reached here without a ref is the first case, because a Browse
+        // row's ref rides in on record_id and a legacy row predates all of it.
+        const f95Only = String(item.source || "").toLowerCase() === "f95";
+        return fail(
+          f95Only
+            ? `Atlas has no catalog entry for "${item.title}", so it cannot create the `
+              + "library record for you. This happens with F95 threads that are not linked "
+              + "to an Atlas database entry. Add the game to your library first, then "
+              + "install this download from its page — the archive is already here and "
+              + "will not need downloading again."
+            : "This download did not record which game it came from, so Atlas cannot add it "
+              + "to your library. It was queued before Atlas could do this — remove it and "
+              + "start the download again from Browse.",
+          "no-catalog-ref",
+        );
+      }
+
+      const entry = await getCatalogEntryByRef(ref).catch((err) => {
+        console.log("[downloads-install] catalog lookup threw", JSON.stringify({
+          downloadId: id, ref, message: err?.message || String(err),
+        }));
+        return null;
+      });
+      if (!entry) {
+        // The catalog refreshes independently of the download queue, so an
+        // entry can retire between a download starting and finishing. Creating a
+        // record from an empty row would produce an "Untitled" game, so it says
+        // so instead.
+        return fail(
+          `This download came from ${describeCatalogRef(ref) || ref}, which is no longer in `
+          + "Atlas's catalog. Install it from the game's page after adding it manually, or "
+          + "check for a database update and try again.",
+          "catalog-entry-missing",
+        );
+      }
+
+      // allowTitleMatch is false: a title+creator resemblance is a heuristic,
+      // not a link, and it is the same heuristic that produced duplicate titles
+      // before. It is not that the result is refused — `games` has
+      // UNIQUE (title, creator, engine) and addGame() returns the existing
+      // record_id on a title hit, so a separate row for the same title cannot
+      // be created — it is that ensureCatalogRecord REPORTS it as
+      // titleCollision rather than absorbing it, and the outcome below says so.
+      const ensured = await ensureCatalogRecord(buildCatalogRecordDeps(), entry, {
+        allowTitleMatch: false,
+      });
+      recordId = ensured.recordId;
+      promotion = { ...ensured, ref };
+      console.log("[downloads-install] promote", JSON.stringify({
+        downloadId: id,
+        ref,
+        recordId,
+        created: ensured.created,
+        via: ensured.via,
+        titleCollision: ensured.titleCollision,
+        mappings: ensured.mappings,
+        title: entry.title,
+      }));
+    }
+
+    // Two different failures used to share one message. getGame() joins a dozen
+    // tables and resolves null when the base row is missing, but it can also
+    // reject — and both surfaced as "no longer exists", which is a claim about
+    // the library rather than a report of what happened. The record id is now
+    // named, because the answer to "why" is almost always which id was asked for.
+    let record = null;
+    let recordLookupError = "";
+    try {
+      record = await getGame(
+        recordId, getAssetBasePath(), process.defaultApp, getMediaStorageMode(),
+      );
+    } catch (lookupErr) {
+      recordLookupError = lookupErr?.message || String(lookupErr);
+    }
+    if (!record) {
+      // Asked directly, so the message can distinguish "the game was removed"
+      // from "the lookup itself failed". A download row keeps the record id it
+      // was queued against, and re-importing a library creates NEW record ids —
+      // so a queue item from before a re-import points at a row that is gone.
+      const stillExists = await dbGet(
+        dbModule.db,
+        `SELECT record_id, title FROM games WHERE record_id = ? LIMIT 1`,
+        [recordId],
+      ).catch(() => null);
+      console.log("[downloads-install] record lookup failed", JSON.stringify({
+        downloadId: id,
+        recordId: recordId,
+        // `recordIdType` used to be logged here to catch a `catalog:…` string
+        // reaching this point. It cannot any more — the id is a validated
+        // integer or the handler already returned — so the useful question is
+        // whether this record was just promoted. A record created seconds ago
+        // that getGame cannot assemble is a different fault from a stale queue
+        // item, and it points at the promotion rather than at the library.
+        promoted: promotion !== null,
+        promotedRef: promotion?.ref || "",
+        promotedCreated: promotion?.created === true,
+        gamesRowExists: Boolean(stillExists),
+        gamesRowTitle: stillExists?.title || "",
+        lookupError: recordLookupError,
+      }));
+      if (recordLookupError) {
+        return fail(`Could not read this game from the library: ${recordLookupError}`, "record-lookup-threw");
+      }
+      if (stillExists) {
+        // The row is there but getGame could not assemble it. That is a data
+        // problem inside the record, not a missing game, and saying "no longer
+        // exists" about a game sitting in the library is simply wrong.
+        return fail(
+          `"${stillExists.title || item.title}" is still in your library, but Atlas could not `
+          + "load its details. Open the game and use Refresh Media, or re-import it, then try again.",
+          "record-details-unreadable",
+        );
+      }
+      if (promotion) {
+        // The record was created moments ago and is already unreadable, so the
+        // stale-queue-item explanation below would be actively misleading.
+        return fail(
+          `Atlas added "${item.title}" to your library but could not read the new record `
+          + `back (record ${recordId}). The download is still here — try installing it again.`,
+          "promoted-record-unreadable",
+        );
+      }
+      return fail(
+        `This download was queued for a game that is no longer in your library `
+        + `(record ${recordId}). If you re-imported your library the ids changed — `
+        + `remove this download and start it again from the game's page.`,
+        "record-row-missing",
+      );
+    }
+
+    const currentConfig = ctx.appConfig || appConfig || {};
+    const targetLibrary = String(currentConfig?.Library?.gameFolder || "").trim();
+    if (!targetLibrary) {
+      return fail("No game folder is set. Choose one in Settings > Library.", "no-library-folder");
+    }
+
+    const finalVersion = normalizeVersionName(version || item.version);
+    const ownerWindow = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+    const notify = (text, progress = 0) => {
+      try {
+        ownerWindow?.webContents?.send("import-progress", { text, progress });
+      } catch { /* window gone */ }
+    };
+
+    // Same layout as a normal import, so downloads and imports are
+    // indistinguishable on disk.
+    // console.log('[downloads-install] record:', JSON.stringify(record, null, 2));
+    const targetBase = getUniquePath(
+      buildStructuredImportPath(
+        targetLibrary,
+        currentConfig?.Library?.libraryFolderStructure,
+        {
+          f95Id: record.f95_id || record.f95Id || "",
+          engine: record.engine || "Unknown",
+          creator: record.creator,
+          title: record.title,
+          version: finalVersion,
+        },
+      ),
+    );
+
+    await downloadManager.setItemState(id, "extracting", { error: "" });
+
+    const resolvedSevenZip = await resolveSevenZipExecutablePath({
+      configuredPath: currentConfig?.Library?.sevenZipPath,
+      currentConfig,
+      currentConfigPath: configPath,
+      ownerWindow,
+      notify: (text) => notify(text, 10),
+    });
+    if (!resolvedSevenZip?.path) return fail("7-Zip is required to install this download.", "no-7zip");
+
+    const extraction = await extractArchiveWithFallback({
+      archivePath: item.filePath,
+      finalPath: targetBase,
+      containmentRoot: targetLibrary || path.dirname(path.resolve(targetBase)),
+      sevenZipBin: resolvedSevenZip.path,
+      session: { canceled: false, cancelRequested: false },
+      progressWindow: ownerWindow,
+      useBundledRarExtractor:
+        isRarArchivePath(item.filePath) && resolvedSevenZip.source === "bundled",
+      currentConfig,
+      currentConfigPath: configPath,
+      ownerWindow,
+      notify: (text) => notify(text, 40),
+      label: record.title || item.title || "",
+    });
+    let gamePath = extraction.finalPath || targetBase;
+
+    // Archives routinely wrap everything in one folder. Flatten it, or every
+    // game ends up one level deeper than the library layout expects.
+    const items = await fsp.readdir(gamePath, { withFileTypes: true }).catch(() => []);
+    const dirs = items.filter((entry) => entry.isDirectory());
+    const files = items.filter((entry) => entry.isFile());
+    if (dirs.length === 1 && files.length === 0) {
+      const subPath = path.join(gamePath, dirs[0].name);
+      for (const entry of await fsp.readdir(subPath)) {
+        await fsp.rename(path.join(subPath, entry), path.join(gamePath, entry));
+      }
+      await fsp.rmdir(subPath).catch(() => {});
+    }
+
+    await downloadManager.setItemState(id, "importing");
+
+    const extensions = getConfiguredGameExtensions(currentConfig);
+    const relativeExec = (await findExecutables(gamePath, extensions))[0] || "";
+    const execPath = relativeExec ? path.join(gamePath, relativeExec) : "";
+    const folderSize = await calculatePathSizeSafe(gamePath);
+
+    // Which build this replaces. Decided by electron/downloads/replaceTarget.js
+    // rather than inline: this chooses a directory to DELETE, and the inline
+    // version filtered on `entry.is_installed` while getGame() emits
+    // `isInstalled`, so it silently targeted whichever row came first. The
+    // chooser is pure and tested, and it refuses to guess between several
+    // installed builds instead of picking one.
+    const { chooseReplaceTarget, describeReplaceOutcome } =
+      require("../downloads/replaceTarget");
+    let replaceTarget = "";
+    let replaceTargetId = null;
+    let replaceChoice = null;
+    if (onComplete === "replace") {
+      replaceChoice = chooseReplaceTarget({
+        versions: record.versions,
+        selectedVersionId: record.selected_version_id,
+        // The install modal asks which version to replace; an inferred answer
+        // is only the fallback for a caller that did not.
+        requestedVersionId: replaceVersionId,
+      });
+      replaceTarget = replaceChoice.version;
+      replaceTargetId = replaceChoice.versionId;
+      console.log("[downloads-install] replace target", JSON.stringify({
+        recordId: recordId,
+        requestedVersionId: replaceVersionId,
+        selectedVersionId: record.selected_version_id,
+        chosen: replaceTarget,
+        chosenId: replaceTargetId,
+        reason: replaceChoice.reason,
+        versionCount: Array.isArray(record.versions) ? record.versions.length : 0,
+      }));
+    }
+    const addResult = await addVersion(
+      {
+        version: finalVersion,
+        folder: gamePath,
+        execPath,
+        folderSize,
+        in_place: 1,
+        source: "download",
+      },
+      recordId,
+    );
+    // addVersion resolves { version }, not a string. Reading it as a string put
+    // "[object Object]" into the version column and the replacement audit.
+    // It can also differ from what we asked for, since addVersion renames for
+    // uniqueness - so this is the value everything downstream must use.
+    const savedVersion = addResult?.version || finalVersion;
+
+    // Replacing swaps the previously installed build out; keep-both leaves it
+    // alone. Never fatal — the new version is already attached, and failing here
+    // would leave the queue looking broken over a cleanup step.
+    //
+    // Every outcome is RECORDED. This used to only catch thrown errors, and each
+    // of the six ways a replace can decline returns rather than throws, so a
+    // replace that did nothing was indistinguishable from one that worked. That
+    // is the single reason "replace does not work" was undiagnosable: there was
+    // no signal to diagnose.
+    let replaceOutcome = null;
+    if (onComplete === "replace") {
+      if (!replaceTarget) {
+        replaceOutcome = { replaced: false, reason: replaceChoice?.reason || "no-target" };
+      } else if (replaceTarget === savedVersion) {
+        replaceOutcome = { replaced: false, reason: "same-version-label" };
+      } else {
+        try {
+          const result = await replaceInstalledVersionAfterImport({
+            recordId: recordId,
+            newVersion: savedVersion,
+            newGamePath: gamePath,
+            replaceVersion: replaceTarget,
+            replaceVersionId: replaceTargetId,
+            // The old version row goes. The normal import path passes false
+            // because it deletes the row itself later; this path does not, so
+            // the default left the superseded version in the library list after
+            // a successful replace.
+            deleteDatabaseRow: true,
+            libraryRoot: targetLibrary,
+            auditDataDir: dataDir,
+            sender: ownerWindow,
+          });
+          replaceOutcome = result || { replaced: false, reason: "no-result" };
+        } catch (err) {
+          console.warn("Version replace after download failed:", err.message);
+          replaceOutcome = { replaced: false, reason: "error", error: err.message };
+        }
+      }
+      console.log("[downloads-install] replace outcome", JSON.stringify({
+        recordId: recordId,
+        replaceTarget,
+        savedVersion,
+        ...replaceOutcome,
+      }));
+    }
+
+    await downloadManager.setItemState(id, "done", {
+      completedAt: item.completedAt || Math.floor(Date.now() / 1000),
+      // Marks the archive as consumed, so the Install action stops offering
+      // itself for this item.
+      installedAt: Math.floor(Date.now() / 1000),
+      version: savedVersion || finalVersion,
+      error: "",
+      // A promoted download now HAS a library record, so the row stops being a
+      // catalog orphan. Written on success only: a row that still carries a null
+      // record_id is one that never installed, which is what makes the Downloads
+      // page able to show cover art for this item afterwards (it looks the game
+      // up by recordId) and what stops a retry re-running the promotion.
+      ...(promotion ? { recordId } : {}),
+    });
+
+    // The game is in the library now, so a wishlist entry for it is stale.
+    // Best-effort and after the install has actually succeeded — dropping a
+    // wishlist entry for an install that then failed would quietly lose
+    // something the user put there deliberately.
+    //
+    // ── Why the row is LOOKED UP rather than the key recomputed ─────────────
+    //
+    // The obvious version of this passes the promotion's ids straight to
+    // removeWishlistEntry(), which runs them back through
+    // normalizeWishlistEntry() to rebuild an identity_key and DELETEs on it.
+    // That is wrong, and silently so.
+    //
+    // promotion.identity comes from getCatalogEntryByRef(), whose SIBLING_IDS
+    // subqueries fill in every provider id sharing the entry's atlas_id. So a
+    // game wishlisted from a LewdCorner or Atlas row — stored under
+    // `atlas:30956`, per the key ladder in normalizeWishlistEntry — comes back
+    // here carrying an f95Id it did not have when it was added. The ladder
+    // prefers f95Id, so the rebuilt key is `f95:44821`, the DELETE matches no
+    // row, and the entry stays on the wishlist forever with nothing logged.
+    //
+    // getWishlistEntry() is the right tool because it matches on identity_key OR
+    // any of the four ids, hydrating through the same joins the wishlist page
+    // uses. Whatever it returns IS the row the user is looking at, and its
+    // identity_key is the one that will actually delete. That also settles the
+    // question the other way round: if it finds nothing, nothing is deleted,
+    // rather than a near-miss key removing some other entry.
+    let wishlistRemoved = false;
+    if (promotion) {
+      try {
+        const { getWishlistEntry, removeWishlistEntry } = require("../db/wishlist");
+        const identity = {
+          atlas_id: promotion.identity?.atlasId ?? null,
+          f95_id: promotion.identity?.f95Id ?? null,
+          lc_id: promotion.identity?.lcId ?? null,
+          steam_id: promotion.identity?.steamId ?? null,
+          title: promotion.identity?.title || item.title,
+          creator: promotion.identity?.creator || item.creator,
+        };
+        const existing = await getWishlistEntry(identity);
+        if (existing?.identity_key) {
+          const removal = await removeWishlistEntry({ identity_key: existing.identity_key });
+          wishlistRemoved = removal?.removed === true;
+          console.log("[downloads-install] wishlist cleared", JSON.stringify({
+            downloadId: id,
+            identityKey: existing.identity_key,
+            removed: wishlistRemoved,
+          }));
+        }
+      } catch (err) {
+        console.warn("Could not clear the wishlist entry after install:", err.message);
+      }
+    }
+    // 5. The archive has been consumed. Deleting is the default - these are
+    // multi-gigabyte files and keeping them silently fills a disk - but the
+    // user can opt to keep it from the install prompt.
+    let archiveDeleted = false;
+    if (!keepArchive && item.filePath) {
+      try {
+        await fsp.rm(item.filePath, { force: true });
+        archiveDeleted = true;
+        await downloadsDb.updateDownload(id, { filePath: "" });
+      } catch (err) {
+        // Never fatal: the install succeeded, and a leftover archive is a
+        // tidiness problem rather than a broken outcome.
+        console.warn("Could not delete the archive after install:", err.message);
+      }
+    }
+
+    // 3/4. Tell every window the record changed, so the library banner drops
+    // its update badge and the detail page re-sorts its version list. Same
+    // event and payload the normal import path uses.
+    const refreshedGame = await getGame(
+      recordId, getAssetBasePath(), process.defaultApp, getMediaStorageMode(),
+    ).catch(() => null);
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) {
+        win.webContents.send("game-updated", refreshedGame || recordId);
+      }
+    });
+
+    notify("", 100);
+    // A declined replace is reported back so the renderer can say so. The new
+    // version IS installed either way, so this is a notice rather than an error
+    // — but the user asked for the old build to go, and silence about it not
+    // going is what made this look broken.
+    const replaceMessage = replaceOutcome ? describeReplaceOutcome(replaceOutcome) : "";
+    return {
+      success: true,
+      version: savedVersion || finalVersion,
+      gamePath,
+      archiveDeleted,
+      replaced: replaceOutcome?.replaced === true,
+      replaceReason: replaceOutcome?.reason || "",
+      replaceMessage,
+      // Present when several installed builds meant Atlas would not guess, so
+      // the UI can offer the choice instead of just reporting a refusal.
+      replaceCandidates: replaceOutcome?.candidates || replaceChoice?.candidates || [],
+      recordId,
+      // What the promotion did, when there was one. `attachedByTitle` is the one
+      // the user needs to see: it means the download landed on a record that
+      // matched by name alone rather than by any id, which is the only outcome
+      // here that might not be the game they meant.
+      promoted: promotion !== null,
+      promotedCreated: promotion?.created === true,
+      attachedByTitle: promotion?.titleCollision === true,
+      promotedTitle: promotion?.identity?.title || "",
+      wishlistRemoved,
+    };
+  } catch (err) {
+    console.error("downloads-install failed:", err);
+    return fail(err.message || String(err), "unhandled");
+  } finally {
+    // Released on every path, including the early returns above — a lock left
+    // set by a failed install would block every later one until a restart.
+    installInProgress = null;
+  }
+});
+
+
+}
+
+// Test-only surface: pure, side-effect-free import helpers exposed so the
+// regression suite can assert their behaviour directly. Attached as a property
+// on the exported handler so the default export (registerImporterHandlers) is
+// unchanged. Not for production use.
+module.exports.__testables = {
+  clampInteger,
+  getUrlHost,
+  sanitizePathSegment,
+  normalizeVersionName,
+  buildStructuredImportPath,
+  toPositiveInteger,
+  isSteamImportRow,
+  getSteamIdFromGame,
+  isGogImportRow,
+  getGogIdFromGame,
+  inferCatalogImportVersion,
+  isArchiveFilePath,
+  isRarArchivePath,
+  getConfiguredExtractionExtensions,
+  getConfiguredGameExtensions,
+  // Exposed so the save-preservation restore path can be exercised directly.
+  // Callable without registerImporterHandlers(ctx): the helpers it needs
+  // (normalizeForPathCompare, removeEmptyParentDirectories, isAllowedDeletionPath)
+  // are module-level function declarations, and passing oldVersionSnapshot +
+  // trustedOldPath + deleteDatabaseRow:false keeps it off the database entirely.
+  replaceInstalledVersionAfterImport,
+};

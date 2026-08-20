@@ -1,0 +1,43 @@
+name: CI
+
+# Regression gate. Runs the framework-free check-*.js scripts AND the Vitest
+# suite on every push and pull request, so behaviour contracts are verified
+# before code merges — separate from the heavier release build in main.yml.
+on:
+  push:
+    # nightly is the integration branch -- everything lands here first, so it
+    # needs the same gate as main or the regression suite only runs on release.
+    branches: [main, nightly]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build browser extension
+        run: npm run build:extension
+
+      - name: Run Vitest suite
+        run: npm run test:run
+
+      - name: Run legacy check scripts + build
+        # `npm run check` also runs test:run (harmless) and vite build, giving us
+        # the syntax checks, asset/layout checks, the test suite, and a renderer
+        # build in one gate. git diff --check catches whitespace/conflict markers.
+        run: npm run check
