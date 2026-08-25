@@ -43,6 +43,7 @@ import { useTheme } from './theme/ThemeProvider.jsx'
 import { useBannerTemplate } from './theme/BannerTemplateProvider.jsx'
 import { getGameTitle, normalizeGameForRenderer } from './utils/gameDisplay.js'
 import { getWishlistIdentityKey, withWishlistStates } from './utils/wishlistIdentity.js'
+import { shouldRefetchCatalog } from './utils/wishlistRefresh.js'
 import { formatPercent, formatProgressNumber, sanitizePercentText } from './utils/formatPercent.js'
 import { BROWSE_MODE_ENABLED } from './features.js'
 
@@ -852,11 +853,16 @@ const App = () => {
       // catalogWithWishlist memo (derived from wishlistIdentityKeys), so the
       // badge/label changes immediately without replacing the catalogGames
       // array and flashing the virtualized grid.
+      //
+      // Nothing is rolled back here. The main process broadcasts
+      // wishlist-updated on every outcome, and handleWishlistUpdated re-reads
+      // the wishlist from the DB, so a write that failed reverts this flip on
+      // the next tick.
       const identityKey = getWishlistIdentityKey(data)
       setWishlistIdentityKeys((prev) => {
         const next = new Set(prev)
-        const wasWishlisted = next.has(identityKey)
-        !wasWishlisted ? next.add(identityKey) : next.delete(identityKey)
+        if (next.has(identityKey)) next.delete(identityKey)
+        else next.add(identityKey)
         return next
       })
       setSelectedGame((prev) => {
@@ -1735,15 +1741,18 @@ const App = () => {
     // Source-tagged: context-menu toggles already flipped wishlistIdentityKeys
     // optimistically in runGameContextAction, so catalogWithWishlist recomputes
     // without replacing the array -- no flash, no fetchCatalogGames needed.
-    // The extension has no optimistic path, so it explicitly requests a full
-    // Browse refresh via payload.source === 'extension'.
+    // shouldRefetchCatalog owns the exception cases (see wishlistRefresh.js):
+    // the extension has no optimistic path, and a wishlistOnly Browse filter
+    // decides its row set server-side so the optimistic flip cannot remove a
+    // row from it. loadWishlistIdentities() above has already re-read the DB,
+    // so this also reverts an optimistic flip whose write failed.
     const handleWishlistUpdated = async (payload) => {
       await Promise.all([
         fetchWishlistGames(),
         loadWishlistIdentities(),
         fetchGames(),
       ])
-      if (payload?.source === 'extension' && browseAvailableRef.current) {
+      if (shouldRefetchCatalog(payload, catalogQueryFiltersRef.current, browseAvailableRef.current)) {
         fetchCatalogGames({ search: catalogSearchRef.current, filters: catalogQueryFiltersRef.current })
       }
       setSelectedGame((current) => {
