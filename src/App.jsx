@@ -2154,7 +2154,7 @@ const App = () => {
                 type="button"
                 onClick={() => window.electronAPI?.openExternalUrl?.(releaseUrlFor(version))}
                 title="Go to Release Page"
-                className="text-text text-xs mr-4 hover:text-accent hover:underline transition-colors cursor-pointer"
+                className="text-text text-xs mr-4 hover:text-accent hover:underline transition-colors cursor-pointer bg-transparent border-none p-0"
               >
                 Version: {version} <span style={{ color: 'Goldenrod' }}>β</span>
               </button>
