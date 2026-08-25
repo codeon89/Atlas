@@ -310,10 +310,17 @@ module.exports = function registerWindowsHandlers(ctx) {
 
   // Opens a native multi-file picker so the renderer can let the user pick
   // local images to add as custom media without knowing the dialog options.
-  ipcMain.handle('select-files', async (event) => {
+  ipcMain.handle('select-files', async (event, options = {}) => {
     const win = BrowserWindow.fromWebContents(event.sender)
+    // Callers that only want images pass { images: true }. Advisory only --
+    // the dialog still lets a determined user type any name -- so the receiving
+    // handler re-checks the extension rather than trusting this.
+    const filters = options?.images
+      ? [{ name: 'Images', extensions: ['webp', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'avif', 'jfif'] }]
+      : undefined
     const result = await dialog.showOpenDialog(win, {
       properties: ['openFile', 'multiSelections'],
+      ...(filters ? { filters } : {}),
     })
     return result.canceled ? [] : result.filePaths
   })
