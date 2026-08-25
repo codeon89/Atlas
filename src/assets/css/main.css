@@ -332,8 +332,10 @@
     background: var(--scrollbar-track);
   }
 
-  /* Downloads: hidden until hover so a long list looks uncluttered but still
-     scrolls. Pseudo-elements only -- adding scrollbar-width/scrollbar-color
+  /* Downloads: scrollbar hidden by default, shown only by the JS-driven
+     `scrollbar-visible` class (on scroll, or while the cursor is in the
+     right-side scroll zone). No `:hover` rule -- that would keep it up anywhere
+     over the list. Pseudo-elements only -- adding scrollbar-width/scrollbar-color
      disables them (tests/scrollbar-styling.test.js). */
   .downloads-scroll::-webkit-scrollbar-thumb {
     background-color: transparent;
@@ -344,8 +346,8 @@
     background: transparent;
   }
 
-  .downloads-scroll:hover::-webkit-scrollbar-thumb {
-    background-color: color-mix(in srgb, var(--scrollbar-thumb) 65%, transparent);
+  .downloads-scroll.scrollbar-visible::-webkit-scrollbar-thumb {
+    background-color: var(--scrollbar-thumb);
     border-color: transparent;
   }
 

@@ -10,10 +10,13 @@ import path from 'node:path'
 // must be its own scroll container. Before this fix the list was clipped to a
 // screenful and only the top entries were reachable.
 //
-// The scrollbar is hidden until hover/scroll (see main.css `.downloads-scroll`)
-// and is styled ONLY through the ::-webkit-scrollbar pseudo-elements -- never
-// `scrollbar-width`/`scrollbar-color`, which would switch every pseudo-element
-// scrollbar rule off (see tests/scrollbar-styling.test.js).
+// The scrollbar is hidden until scroll/right-edge proximity (see main.css
+// `.downloads-scroll`) and is styled ONLY through the ::-webkit-scrollbar
+// pseudo-elements -- never `scrollbar-width`/`scrollbar-color`, which would
+// switch every pseudo-element scrollbar rule off (see
+// tests/scrollbar-styling.test.js). Visibility is toggled by a JS-driven
+// `scrollbar-visible` class (scroll events + right-edge mouse proximity) and is
+// never driven by a CSS `:hover` rule.
 
 const DIRECTORY = path.join(__dirname, '..', 'src', 'components', 'downloads')
 const pageSource = fs.readFileSync(path.join(DIRECTORY, 'DownloadsPage.jsx'), 'utf8')
@@ -38,9 +41,10 @@ describe('the Downloads page scrolls its own list', () => {
   })
 
   it('the list is wrapped in the single scroll container', () => {
-    expect(pageSource).toContain(
-      '<div className="flex-1 min-h-0 overflow-y-auto downloads-scroll px-4 sm:px-6 py-4 pb-10">',
+    expect(pageSource).toMatch(
+      /overflow-y-auto downloads-scroll px-4 sm:px-6 py-4 pb-10/,
     )
+    expect(pageSource).toContain('onScroll={handleScroll}')
   })
 
   it('there is only one scrolling region in the view', () => {
@@ -50,9 +54,12 @@ describe('the Downloads page scrolls its own list', () => {
 })
 
 // The hidden-but-present scrollbar utility lives in main.css. Asserts the class
-// exists, keeps the scrollbar invisible until hover, and does not introduce the
-// standard properties that would disable the whole pseudo-element block.
-describe('.downloads-scroll hides its scrollbar until hover', () => {
+// exists, keeps the scrollbar invisible until the JS-driven `scrollbar-visible`
+// class is toggled, and does not introduce the standard properties that would
+// disable the whole pseudo-element block. The class is toggled by scroll events
+// and right-edge mouse proximity in DownloadsPage.jsx; visibility is driven
+// solely by that class, never by a CSS `:hover` rule.
+describe('.downloads-scroll hides its scrollbar until JS shows it', () => {
   const css = fs.readFileSync(path.join(__dirname, '..', 'src', 'assets', 'css', 'main.css'), 'utf8')
   // Declarations only; the comments around these rules explain how they work.
   const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '')
@@ -64,10 +71,14 @@ describe('.downloads-scroll hides its scrollbar until hover', () => {
       .not.toMatch(/scrollbar-(width|color)/)
   })
 
-  it('is invisible at rest and revealed on hover', () => {
+  it('is invisible at rest and only revealed by the scrollbar-visible class', () => {
     expect(block).toMatch(
       /\.downloads-scroll::-webkit-scrollbar-thumb\s*\{\s*background-color:\s*transparent/,
     )
-    expect(block).toMatch(/\.downloads-scroll:hover::-webkit-scrollbar-thumb\s*\{/)
+    expect(block).toMatch(
+      /\.downloads-scroll\.scrollbar-visible::-webkit-scrollbar-thumb\s*\{\s*background-color:\s*var\(--scrollbar-thumb\)/,
+    )
+    // No `:hover` rule -- visibility must be driven solely by JS.
+    expect(block).not.toMatch(/\.downloads-scroll:hover/)
   })
 })
