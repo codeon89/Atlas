@@ -1,6 +1,7 @@
 # Changelog - PATCHED
 
 ## Fork's Nightly Changes
+- Fix multiple executable chooser rendering logic, and redo the executable chooser UI.[PR#389](https://github.com/towerwatchman/Atlas/pull/389)
 - Fixed bat file launcher for Atlas.[PR#388](https://github.com/towerwatchman/Atlas/pull/388)
 - Allow setting folder and program locations by typing or paste a path directly besides using Browse / Select Folder button.[PR#385](https://github.com/towerwatchman/Atlas/pull/385)
 - Allow Win download links to show up for Linux platform since Linux can run both Linux version and also use Wine to run Win executable.[PR#377](https://github.com/towerwatchman/Atlas/pull/377)
