@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+
+  
 ### Added
 - Custom media uploads in the Game Details Media tab: add preview images from local files, a drag-and-drop zone, or an image URL, with live progress. Previews can be reordered by drag and the order persists in a new `preview_sort` table keyed by remote URL (or relative path for custom uploads), so it survives re-downloads, stream/download switches and metadata refreshes. Previews now carry a source logo and a storage-location badge, and custom previews can be deleted independently of downloaded ones.
 - Add Buzzheavier host support (`buzzheavier.com`, `bzzhr.to`, `bzzhr.co`). The download route is behind a Cloudflare challenge, so the resolve runs in a browser window: it clicks the htmx download button, captures the `HX-Redirect` (or an attachment via `will-download`), and hands the resolved CDN link plus the browser's own cookies/UA back to the downloader. The resolve partition is persistent so a solved challenge survives a restart -- only Cloudflare's own challenge cookies are kept, everything else is stripped after each resolve -- and resolves run one at a time, since a shared session cannot carry two concurrently. Each time your IP changes there is a brief auto-resolve window while the challenge is re-solved.

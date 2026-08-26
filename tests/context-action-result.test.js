@@ -1,5 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'vitest'
 import Module from 'module'
+import fs from 'fs'
+import path from 'path'
 
 // run-context-action reported {success:true} for everything, unconditionally.
 // The renderer then discarded it anyway (App.jsx fired and forgot), so a failed
