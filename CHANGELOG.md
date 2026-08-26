@@ -3,9 +3,7 @@
 ## Unreleased
 
 ### Changed
-- Allow setting folder and program locations by typing or paste a path directly besides using Browse / Select Folder button. 
-  - Affected locations:  Atlas Importer, Library path settings,and Emulators. The 7z field path is not touched as it have more requirements than the based one.
-  - Path resolution highlighting: red if invalid, green if path exists or pass the check.
+
   
 ### Added
 - Custom media uploads in the Game Details Media tab: add preview images from local files, a drag-and-drop zone, or an image URL, with live progress. Previews can be reordered by drag and the order persists in a new `preview_sort` table keyed by remote URL (or relative path for custom uploads), so it survives re-downloads, stream/download switches and metadata refreshes. Previews now carry a source logo and a storage-location badge, and custom previews can be deleted independently of downloaded ones.
