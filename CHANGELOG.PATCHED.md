@@ -1,9 +1,8 @@
 # Changelog - PATCHED
 
 ## Fork's Nightly Changes
+- Fixed bat file launcher for Atlas.[PR#388](https://github.com/towerwatchman/Atlas/pull/388)
 - Allow setting folder and program locations by typing or paste a path directly besides using Browse / Select Folder button.[PR#385](https://github.com/towerwatchman/Atlas/pull/385)
-  - Affected locations:  Atlas Importer, Library path settings,and Emulators. The 7z field path is not touched as it have more requirements than the based one.
-  - Path resolution highlighting: red if invalid, green if path exists or pass the check.
 - Allow Win download links to show up for Linux platform since Linux can run both Linux version and also use Wine to run Win executable.[PR#377](https://github.com/towerwatchman/Atlas/pull/377)
 
 ## Independent Changes
