@@ -1134,7 +1134,6 @@ const deleteBanner = (recordId, appPath, isDev) => {
     try {
       const mediaRoot = path.resolve(getAssetBasePath(appPath, isDev), "data", "images");
       const banners = await getBanners(recordId, appPath, isDev);
-
       for (const banner_path of banners) {
         const filePath = banner_path.replace("file://", "");
         try {
