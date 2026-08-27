@@ -342,6 +342,25 @@ function registerLewdCornerMediaHeaders() {
   registerMediaAuthHeaders()
 }
 
+// Dev-only diagnostic for the LewdCorner tier check. When verifyLcTier()
+// reports lcTierMismatch, the LewdCorner shop page parser read no owned
+// rank but the thread probe — which reflects real content access — concluded
+// the user is Plus. That mismatch is the stale-selector signal: the [LewdCorner]
+// config keys (statusPillClass / statusPillOwnedToken / statusPillOwnedText)
+// likely no longer match LC's markup. Gated on !app.isPackaged so it never
+// fires in a shipped build; the user-facing tier gate stays correct regardless
+// because the probe already resolved the real tier.
+function warnOnLcTierMismatch(result) {
+  if (app.isPackaged || !result) return
+  if (result.lcTierMismatch === true) {
+    console.warn(
+      'LewdCorner shop parser looks stale: shop reported \'Free\' but ' +
+      'the thread probe confirmed real content access. Check the [LewdCorner] ' +
+      'statusPill selectors in the config.',
+    )
+  }
+}
+
 // ── App data paths ──────────────────────────────────────────────────────────
 
 app.commandLine.appendSwitch('force-color-profile', 'srgb')
@@ -1737,24 +1756,20 @@ function showExecutableChooser(title, version, executables) {
     executableChooserWindow.webContents.send('init-executable-chooser', { title, version, executables })
     return
   }
+  // Size relative to the primary display: a fifth of the width and half the
+  // height keeps the chooser compact beside the (large) import list while still
+  // leaving room for many executable candidates on long scroll lists.
+  const { width: sw, height: sh } = screen.getPrimaryDisplay().workAreaSize
   const windowState = applySavedWindowBounds('executableChooser', {
-    width: 600,
-    height: 400,
+    width: Math.round(sw / 5),
+    height: Math.round(sh / 2),
     frame: false,
-    // Windows draws a native DWM resize border (often tinted with the
-    // system accent color) around frame:false windows that aren't also
-    // transparent -- that's the stray colored line on the left/right/
-    // bottom edges that no amount of CSS could ever reach, since it's
-    // painted by the OS outside the web content entirely. The renderer
-    // already paints a fully opaque background on every window's root
-    // element (bg-canvas/bg-secondary/etc. -- see e.g. App.jsx), so it's
-    // safe to go fully transparent at the native level instead.
     transparent: true,
-    // Windows needs an explicit zero-alpha background color for true
-    // per-pixel transparency to render cleanly -- without it, the
-    // "transparent" region (e.g. outside a rounded-corner content clip)
-    // can render with artifacts instead of properly showing through.
     backgroundColor: '#00000000',
+    // Allow the user to resize so long executable lists are reachable; the
+    // renderer already paints an opaque, rounded background on a transparent
+    // native window, so resizing won't expose OS-drawn artifacts.
+    resizable: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -2286,10 +2301,31 @@ app.whenReady().then(async () => {
   // Load encrypted site accounts before the window (and its webRequest cookie
   // hook) come up, then refresh any expired sessions in the background.
   try {
-    accountStore.init(dataDir)
+    accountStore.init(dataDir, appConfig?.LewdCorner)
     accountStore.refreshAllAccounts().catch((err) =>
       console.warn('Account cookie refresh failed:', err.message),
     )
+    // Tier verification: scrape LC membership tier after cookies are fresh.
+    // Runs in the background on startup and periodically. The recheck interval
+    // reads lcTierRecheckHours from config (default 24h); a recheck that finds the
+    // cached tier still fresh is skipped inside verifyLcTier, so this only scrapes
+    // when actually stale. Re-linking the account re-triggers it immediately via
+    // commitAccount's forced verifyLcTier.
+    const lcTierRecheckHours = Number(appConfig?.LewdCorner?.lcTierRecheckHours)
+    const lcTierRecheckInterval =
+      (Number.isFinite(lcTierRecheckHours) ? lcTierRecheckHours : 24) * 60 * 60 * 1000
+    const runLcTierCheck = () =>
+      accountStore.verifyLcTier().then((result) => {
+        warnOnLcTierMismatch(result)
+      })
+    runLcTierCheck().catch((err) =>
+      console.warn('Initial tier check failed:', err.message),
+    )
+    setInterval(() => {
+      runLcTierCheck().catch((err) =>
+        console.warn('Periodic tier check failed:', err.message),
+      )
+    }, lcTierRecheckInterval)
   } catch (err) {
     console.warn('Account store init failed:', err.message)
   }
