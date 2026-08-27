@@ -130,6 +130,195 @@ async function checkCookiesLive(site, cookieArray) {
   }
 }
 
+// Escape a literal string so it can be used inside a RegExp constructor.
+// Used to fold a config-supplied CSS class name into the shop-page regex.
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// Rank data-item-id values that grant member+ / Plus access. UwU (18) is
+// cosmetic-only and does not count.
+const LC_RANK_IDS = new Set([2, 6, 7, 8, 12, 13])
+
+// Default endpoints + selectors for LewdCorner tier detection. Mirrors the
+// configSchema [LewdCorner] section; a config value that is blank/empty falls
+// back to these. Kept here so the module runs standalone (and unit-tests pass)
+// without config plumbing, and so a markup change can be handled by config.
+const LC_TIER_DEFAULTS = {
+  probeThreadUrl: 'https://lewdcorner.com/threads/17729',
+  shopUrl: 'https://lewdcorner.com/shop/index.php',
+  shopPrestigeUrl: 'https://lewdcorner.com/shop/index.php?rank_bundle=prestige',
+  statusPillClass: 'statusPill',
+  statusPillOwnedToken: 'owned',
+  statusPillOwnedText: 'owned',
+}
+
+// Fold an optional per-site config object over the LC defaults, dropping any
+// blank value so a cleared config key falls back to the built-in default.
+function lcConfigWithDefaults(cfg) {
+  if (!cfg || typeof cfg !== 'object') return { ...LC_TIER_DEFAULTS }
+  const out = { ...LC_TIER_DEFAULTS }
+  for (const key of Object.keys(LC_TIER_DEFAULTS)) {
+    const v = cfg[key]
+    if (typeof v === 'string' && v.trim() !== '') out[key] = v
+  }
+  return out
+}
+
+// Scrape the LewdCorner shop page to determine which ranks the user owns.
+// Returns the stored tier value 'VIP' if any Plus-granting rank is owned,
+// 'Free' otherwise. 'Free'/'VIP' is the persisted vocabulary shared with the
+// content-tier column; the Accounts page shows Standard/Plus instead.
+//
+// LewdCorner's shop is a custom add-on, not stock XenForo. Verified logged-in
+// markup: an owned rank renders a green ownership pill (class "statusPill
+// owned", text "Owned") with a disabled "Owned" buy button, while a rank still
+// for sale shows an "Available" pill with an enabled "Purchase Rank" button.
+// Matching on the ownership pill is therefore the authoritative signal. The
+// container class, the owned-token, and the pill text are all config-driven so
+// a rename is a settings edit. This is best-effort — a mismatch (or a renamed
+// selector) simply yields no owned rank, which the caller resolves against the
+// thread probe (see scrapeUserTier), and it never throws, so a layout change
+// cannot break login or image streaming.
+async function scrapeTierFromShopPage(site, cookieArray, lcConfig) {
+  const cfg = SITES[site]
+  if (!cfg) return null
+  const jar = new CookieJar()
+  jar.loadArray(cookieArray)
+  if (jar.size === 0) return null
+
+  const lc = lcConfigWithDefaults(lcConfig)
+
+  // Both shop URLs are configurable (a URL change is a settings edit). An empty
+  // configured URL falls back to the base + default path.
+  const shopUrls = [
+    lc.shopUrl || cfg.base + '/shop/index.php',
+    lc.shopPrestigeUrl || cfg.base + '/shop/index.php?rank_bundle=prestige',
+  ]
+
+  let anyPageLoaded = false
+
+  // Build the regex from the configured container class so a container rename
+  // is honored without code changes. The owned-token/text are checked against
+  // the pill's class fragment and inner text respectively.
+  const pillClass = escapeRegExp(lc.statusPillClass)
+  const pillRegex = new RegExp(
+    'data-item-id="(\\d+)"[\\s\\S]*?<span[^>]*class="[^"]*' + pillClass + '([^"]*)"[^>]*>([^<]*)</span>',
+    'gi',
+  )
+  const ownedToken = lc.statusPillOwnedToken ? lc.statusPillOwnedToken.toLowerCase() : ''
+  const ownedText = lc.statusPillOwnedText
+
+  for (const url of shopUrls) {
+    try {
+      const r = await axios.get(url, {
+        headers: { ...DEFAULT_HEADERS, Cookie: jar.header() },
+        timeout: 30000,
+        maxRedirects: 5,
+        validateStatus: () => true,
+      })
+      if (r.status !== 200) continue
+      anyPageLoaded = true
+      const html = String(r.data || '')
+
+      // Each rank card carries data-item-id and an ownership pill. A card is
+      // owned when the pill's class contains the owned token (LC styles it
+      // green) or its text matches the owned text (kept as a fallback in case
+      // the class token ever changes).
+      let match
+      const lowerOwnedText = ownedText.toLowerCase()
+      while ((match = pillRegex.exec(html)) !== null) {
+        const rankId = Number(match[1])
+        const cls = match[2]
+        const text = match[3].trim().toLowerCase()
+        if (!LC_RANK_IDS.has(rankId)) continue
+        if (
+          (ownedToken && cls.split(/\s+/).some((c) => c.toLowerCase().includes(ownedToken))) ||
+          (lowerOwnedText && text === lowerOwnedText)
+        ) {
+          return 'VIP'
+        }
+      }
+    } catch (err) {
+      // Network or parse failure on one URL — try the next.
+      continue
+    }
+  }
+
+  // Shop page loaded but no Plus rank found → Free. If no page loaded at
+  // all, return null (inconclusive) so the caller falls back to thread probing.
+  return anyPageLoaded ? 'Free' : null
+}
+
+// Probe a known member-gated thread. If the attachment-hide message is present,
+// the user cannot see attachments (Standard). If it's absent, they can (Plus).
+async function probeTierFromThread(site, cookieArray, lcConfig) {
+  const cfg = SITES[site]
+  if (!cfg) return null
+  const lc = lcConfigWithDefaults(lcConfig)
+  const configuredUrl = lc.probeThreadUrl
+  if (!configuredUrl) return null
+  const jar = new CookieJar()
+  jar.loadArray(cookieArray)
+  if (jar.size === 0) return null
+
+  try {
+    const r = await axios.get(configuredUrl, {
+      headers: { ...DEFAULT_HEADERS, Cookie: jar.header() },
+      timeout: 30000,
+      maxRedirects: 5,
+      validateStatus: () => true,
+    })
+    if (r.status !== 200) return null
+    const html = String(r.data || '')
+
+    // XenForo hides attachments behind this block for non-authorized users.
+    if (html.includes('messageHide messageHide--attach')) {
+      return 'Free'
+    }
+    // If the thread loaded and there's no hide block, user can see attachments.
+    // But only conclude Plus if we also see actual attachment content — the hide
+    // block might just have been removed site-wide. Check for the attachment
+    // wrapper that appears when images are visible.
+    if (html.includes('message-attachment') || html.includes('bbImage')) {
+      return 'VIP'
+    }
+    // Thread loaded but we can't determine attachment visibility — inconclusive.
+    return null
+  } catch (err) {
+    return null
+  }
+}
+
+// Determine the logged-in user's LewdCorner tier. Tries the shop page first
+// (definitive), falls back to a thread probe. Returns
+// { tier: 'Free' | 'VIP' | null, lcTierMismatch: boolean } where 'Free'≈Standard
+// and 'VIP'≈Plus.
+//
+// `lcTierMismatch` is the stale-parser signal: it is true only when the
+// LewdCorner shop page concluded 'Free' (no Plus rank parsed) yet the thread
+// probe — which reflects actual content access — concluded 'VIP'. That
+// mismatch is the reliable indicator that the shop's selector/container has
+// drifted, because it cannot fire for a genuinely Free user (whose probe is
+// also Free) or when the shop page simply failed to load (shop === null, an
+// outage rather than a parser bug). Consumers gate a developer warning on this
+// flag.
+async function scrapeUserTier(site, cookieArray, lcConfig) {
+  const shopResult = await scrapeTierFromShopPage(site, cookieArray, lcConfig)
+  if (shopResult === 'VIP') return { tier: 'VIP', lcTierMismatch: false }
+  if (shopResult === 'Free') {
+    // Shop says Standard — confirm with thread probe to guard against a false
+    // Standard from a broken shop page parse.
+    const probeResult = await probeTierFromThread(site, cookieArray, lcConfig)
+    if (probeResult === 'VIP') return { tier: 'VIP', lcTierMismatch: true }
+    return { tier: 'Free', lcTierMismatch: false }
+  }
+  // Shop failed entirely — rely on thread probe. A shop that will not load is
+  // an outage, not a stale parser, so this is NOT a mismatch.
+  const probeResult = await probeTierFromThread(site, cookieArray, lcConfig)
+  return { tier: probeResult, lcTierMismatch: false }
+}
+
 // Full login. Returns a cookie array ({name,value,domain,path}) on success,
 // throws AuthError-style Error on failure (bad creds / captcha / 2FA).
 async function login(site, username, password) {
@@ -207,4 +396,8 @@ module.exports = {
   checkCookiesLive,
   cookieHeaderFromArray,
   isLoggedInHtml,
+  scrapeUserTier,
+  scrapeTierFromShopPage,
+  probeTierFromThread,
+  LC_RANK_IDS,
 }

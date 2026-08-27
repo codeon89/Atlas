@@ -659,6 +659,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   verifyAccountBrowser: (payload) => ipcRenderer.invoke("accounts-verify-browser", payload),
   saveAccount: (payload) => ipcRenderer.invoke("accounts-save", payload),
   removeAccount: (payload) => ipcRenderer.invoke("accounts-remove", payload),
+  getUserTier: (payload) => ipcRenderer.invoke("lewdcorner-tier", payload),
 
   // ── Steam (owned library) ───────────────────────────────────────────────
   steamStatus: () => ipcRenderer.invoke("steam-status"),
