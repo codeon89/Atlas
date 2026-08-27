@@ -208,6 +208,44 @@ const buildDefaultConfig = (dataDir = '') => ({
   NSFW: {
     enabled: false,
   },
+  // Endpoints + selectors used to scrape the logged-in LC user's membership
+  // tier. Kept in config so a markup or URL change can be addressed with a
+  // settings edit instead of a code change + release. Values are informational
+  // overrides of hardcoded defaults; a key left '' (or blank) falls back to the
+  // built-in default for that key.
+  //
+  // The statusPill OWNED token is the class-attribute fragment LC signals
+  // ownership with (verified Aug 2026: class "statusPill owned", text "Owned").
+  // statusPillClass is the ownership-pill container class itself — kept fully
+  // configurable so a future rename of either the container or the owned
+  // fragment is a settings edit, not a code change.
+  //
+  // This is a best-effort escape hatch: it only helps if LC retains the same
+  // page structure and changes just a URL or a class/text name here. A deeper
+  // restructure (different attribute, different element, redesigned markup)
+  // still needs a code edit to the parser.
+  LewdCorner: {
+    // Member-gated thread probed as a fallback when the shop page is
+    // unreachable or its parser yields no confident answer.
+    probeThreadUrl: 'https://lewdcorner.com/threads/17729',
+    shopUrl: 'https://lewdcorner.com/shop/index.php',
+    shopPrestigeUrl: 'https://lewdcorner.com/shop/index.php?rank_bundle=prestige',
+    // Container + owned-token for the rank ownership pill.
+    statusPillClass: 'statusPill',
+    statusPillOwnedToken: 'owned',
+    statusPillOwnedText: 'owned',
+    // How fresh the cached membership tier must be, in hours, before a re-scrape
+    // is skipped. The tier is scraped (a few requests) then held in the encrypted
+    // account blob keyed to tierCheckedAt; whenever a recheck — on startup, on the
+    // periodic timer, or a force — runs, it is skipped if the cached tier is newer
+    // than this window. So it bounds network traffic to at most one scrape per
+    // window regardless of how often the client is opened. 0 disables the periodic
+    // recheck entirely (startup + re-link still verify). This is a rolling window
+    // from the last successful check, not a fixed time of day. A promotion
+    // (Standard → Plus) is only noticed on the next recheck, and re-linking the
+    // account always forces a fresh scrape regardless of freshness.
+    tierRecheckHours: 24,
+  },
   WindowBounds: {},
 })
 
