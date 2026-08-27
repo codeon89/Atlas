@@ -184,7 +184,7 @@ test('VIP user sees all LewdCorner content (no gate applied)', async () => {
   expect(allTitles).toContain('Steam row')
 })
 
-// The gate is conditional on getUserTier('lewdcorner') !== 'VIP'. Verify the
+// The gate is conditional on getLcUserTier() !== 'VIP'. Verify the
 // source code wraps the predicate in this check.
 test('the index gate is conditional on user tier', () => {
   const source = read('electron', 'db', 'catalogIndex.js')
@@ -192,7 +192,7 @@ test('the index gate is conditional on user tier', () => {
     source.indexOf('const buildIndexWhere'),
     source.indexOf('const buildIndexOrderBy'),
   )
-  expect(builder).toMatch(/getUserTier\(['"]lewdcorner['"]\)\s*!==\s*['"]VIP['"]/)
+  expect(builder).toMatch(/getLcUserTier\(\)\s*!==\s*['"]VIP['"]/)
   expect(builder).toContain(INDEX_PREDICATE)
 })
 
@@ -202,5 +202,5 @@ test('the union gate is conditional on user tier', () => {
   const idx = source.indexOf(UNION_PREDICATE)
   expect(idx).toBeGreaterThan(-1)
   const surrounding = source.slice(Math.max(0, idx - 200), idx + UNION_PREDICATE.length + 50)
-  expect(surrounding).toMatch(/getUserTier\(['"]lewdcorner['"]\)\s*!==\s*['"]VIP['"]/)
+  expect(surrounding).toMatch(/getLcUserTier\(\)\s*!==\s*['"]VIP['"]/)
 })

@@ -35,22 +35,22 @@ module.exports = function registerAccountsHandlers(ctx) {
     return accountStore.removeAccount(site)
   })
 
-  // Tier detection — returns the cached tier for a site, or triggers a fresh
+  // Tier detection — returns the cached LewdCorner tier, or triggers a fresh
   // check when forceRefresh is set. forceRefresh also returns lcTierMismatch:
   // the dev-only stale-parser signal (true when the LC shop page read no owned
   // rank but the thread probe found real content access), which the main process
   // surfaces as a dev console warning.
-  ipcMain.handle('lewdcorner-tier', async (event, { site, forceRefresh = false } = {}) => {
+  ipcMain.handle('lewdcorner-tier', async (event, { forceRefresh = false } = {}) => {
     try {
       if (forceRefresh) {
-        const result = await accountStore.verifyTier(site, { force: true })
+        const result = await accountStore.verifyLcTier({ force: true })
         return {
           tier: result.tier || null,
           checkedAt: Date.now(),
           lcTierMismatch: result.lcTierMismatch === true,
         }
       }
-      return { tier: accountStore.getUserTier(site) }
+      return { tier: accountStore.getLcUserTier() }
     } catch (err) {
       console.error('lewdcorner-tier error:', err)
       return { tier: null }

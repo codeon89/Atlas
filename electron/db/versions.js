@@ -15,7 +15,7 @@ const {
   unionColumnsForSearchFieldIds, normalizeSearchFieldIds,
 } = require('./searchFields')
 const { extractUrlId } = require('./urlIdExtractor')
-const { getUserTier } = require('../accounts/accountStore')
+const { getLcUserTier } = require('../accounts/accountStore')
 
 // A search payload may carry `fields` (current) or `type` (legacy, still in
 // saved_filters.json). Neither means "use the default set".
@@ -1406,9 +1406,9 @@ const getCatalogGamesFromUnion = (appPath, isDev, options = {}) => {
     // content tier fail `= 'Free'` and are hidden the same as 'VIP', until a
     // rescrape fills the tier in.
     //
-    // Not-logged-in (getUserTier returns null) is treated the same as Standard:
+    // Not-logged-in (getLcUserTier returns null) is treated the same as Standard:
     // an unauthenticated user must not see members-only content.
-    if (getUserTier('lewdcorner') !== 'VIP') {
+    if (getLcUserTier() !== 'VIP') {
       filterWhereParts.push(`(catalog.lc_id IS NULL OR catalog.lewdcornerTier = 'Free')`);
     }
     const toArray = (value) => {

@@ -46,7 +46,7 @@ const {
   indexColumnsForSearchFieldIds, normalizeSearchFieldIds,
 } = require('./searchFields')
 const { extractUrlId } = require('./urlIdExtractor')
-const { getUserTier } = require('../accounts/accountStore')
+const { getLcUserTier } = require('../accounts/accountStore')
 
 // A search payload may carry `fields` (current) or `type` (legacy). Neither
 // present means the caller wants the default set.
@@ -959,10 +959,10 @@ const buildIndexWhere = (search = {}, filters = {}) => {
   // agree — filtering only the page would size the grid's scrollbar for rows it
   // never shows.
   //
-  // Not-logged-in (getUserTier returns null) is intentionally treated the same
+  // Not-logged-in (getLcUserTier returns null) is intentionally treated the same
   // as Standard: an unauthenticated user must not see members-only content. It
   // flips to full visibility only once tier detection reports 'VIP'.
-  if (getUserTier('lewdcorner') !== 'VIP') {
+  if (getLcUserTier() !== 'VIP') {
     parts.push(`(ci.lc_id IS NULL OR lct.tier = 'Free')`)
   }
   const params = []

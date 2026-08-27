@@ -18,7 +18,7 @@ const {
   login,
   checkCookiesLive,
   cookieHeaderFromArray,
-  scrapeUserTier,
+  scrapeLcUserTier,
 } = require('./xenforoAuth')
 const { loginWithBrowser } = require('./browserLogin')
 
@@ -27,16 +27,16 @@ let storePath = null
 // where secretEnc decrypts to JSON { password, cookies: [{name,value,domain,path}] }
 let store = {}
 // LewdCorner tier-detection config (shop/probe URLs + selectors), passed at
-// init from appConfig.LewdCorner. Held module-level so verifyTier()/verifyAllTiers()
+// init from appConfig.LewdCorner. Held module-level so verifyLcTier()
 // can feed it to xenforoAuth without threading it through every call site.
 let lcConfig = null
 // In-memory decrypted cookie header per site, for the synchronous webRequest path.
 const cookieHeaderCache = Object.create(null)
-// In-memory user tier per site ('Free' | 'VIP' | null). The stored vocabulary
+// In-memory LewdCorner user tier ('Free' | 'VIP' | null). The stored vocabulary
 // matches the content-tier column; Accounts.jsx maps Free→Standard, VIP→Plus
 // for display. Populated from the encrypted blob on init; updated by
-// verifyTier().
-const tierCache = Object.create(null)
+// verifyLcTier().
+let lcTierCache = null
 
 // Successful-but-not-yet-saved logins, keyed by site. The Verify / browser-login
 // steps populate this; commitAccount() persists it without logging in again.
@@ -100,8 +100,8 @@ function persist() {
 function rebuildCookieCache() {
   for (const site of Object.keys(SITES)) {
     cookieHeaderCache[site] = ''
-    tierCache[site] = null
   }
+  lcTierCache = null
   for (const [site, entry] of Object.entries(store)) {
     if (!SITES[site]) continue
     const secret = readSecret(entry)
@@ -111,6 +111,11 @@ function rebuildCookieCache() {
     if (secret && secret.tier) {
       tierCache[site] = secret.tier
     }
+  }
+  const lcEntry = store.lewdcorner
+  if (lcEntry) {
+    const secret = readSecret(lcEntry)
+    if (secret && secret.tier) lcTierCache = secret.tier
   }
 }
 
@@ -154,8 +159,8 @@ function refererForUrl(url) {
 
 // Synchronous tier lookup from the in-memory cache. Returns 'Free' | 'VIP' |
 // null (unknown / not checked yet). Used by the Browse SQL gate and UI.
-function getUserTier(site) {
-  return tierCache[site] || null
+function getLcUserTier() {
+  return lcTierCache || null
 }
 
 function listAccounts() {
@@ -261,9 +266,11 @@ function commitAccount(site) {
   // Background tier check — don't block the caller. Force it: the user just
   // (re-)connected, so a cached tier would be stale and they expect the gate to
   // reflect the account right now.
-  verifyTier(site, { force: true }).catch((err) =>
-    console.warn(`accountStore: post-commit tier check failed for ${site}:`, err.message),
-  )
+  if (site === 'lewdcorner') {
+    verifyLcTier({ force: true }).catch((err) =>
+      console.warn(`accountStore: post-commit tier check failed for ${site}:`, err.message),
+    )
+  }
 
   return { ok: true }
 }
@@ -300,7 +307,7 @@ async function ensureFreshCookies(site) {
   // Password account — re-login with the stored credentials.
   try {
     const cookies = await login(site, entry.username, secret.password)
-    // Re-read the live entry: a concurrent verifyTier may have updated the tier
+    // Re-read the live entry: a concurrent verifyLcTier may have updated the tier
     // while we were re-logging in. Update cookies but preserve the live tier.
     const liveEntry = store[site]
     if (!liveEntry) return false
@@ -333,24 +340,19 @@ async function refreshAllAccounts() {
 
 // Scrape the user's LewdCorner tier (shop page + thread probe) and persist the
 // result in the encrypted blob. Safe to call on startup or periodically.
-// Only operates on sites that have a stored account with valid cookies.
+// Only operates on the LewdCorner stored account with valid cookies.
 // Returns { ok, tier?, lcTierMismatch?, fromCache?, error? } where lcTierMismatch
 // is the dev-only stale-parser signal (true only when the shop page concluded
 // 'Free' but the thread probe — reflecting real content access — concluded
 // 'VIP').
 //
 // Unless `{ force: true }` is passed, the network scrape is skipped when the
-// cached tier is still fresh (checked within tierRecheckHours). This bounds
+// cached tier is still fresh (checked within lcTierRecheckHours). This bounds
 // shop-page traffic to at most one scrape per window no matter how often the
 // client is opened; re-linking the account passes force so a reconnect always
 // re-scrapes immediately.
-async function verifyTier(site, { force = false } = {}) {
-  if (!SITES[site]) return { ok: false, error: `Unsupported site: ${site}` }
-  // Tier detection is LewdCorner-only: LC is the only site this feature targets,
-  // and the shop/probe URLs + selectors are LC-specific. f95 and any other site
-  // must never be scraped here — the shop page doesn't exist for them.
-  if (site !== 'lewdcorner') return { ok: false, error: `Tier detection unsupported for site: ${site}` }
-  const entry = store[site]
+async function verifyLcTier({ force = false } = {}) {
+  const entry = store.lewdcorner
   if (!entry) return { ok: false, error: 'No account configured.' }
 
   const secret = readSecret(entry)
@@ -358,10 +360,10 @@ async function verifyTier(site, { force = false } = {}) {
     return { ok: false, error: 'No valid cookies — please re-authenticate.' }
   }
 
-  // Reuse a still-fresh cached tier instead of re-scraping. tierRecheckHours of
+  // Reuse a still-fresh cached tier instead of re-scraping. lcTierRecheckHours of
   // 0 disables the periodic recheck entirely (startup + a force still verify).
-  const recheckHours = lcConfig && typeof lcConfig.tierRecheckHours === 'number'
-    ? lcConfig.tierRecheckHours
+  const recheckHours = lcConfig && typeof lcConfig.lcTierRecheckHours === 'number'
+    ? lcConfig.lcTierRecheckHours
     : 24
   if (!force && recheckHours > 0 && secret.tier && secret.tierCheckedAt) {
     const ageMs = Date.now() - secret.tierCheckedAt
@@ -370,31 +372,31 @@ async function verifyTier(site, { force = false } = {}) {
     }
   }
 
-  const { tier, lcTierMismatch } = await scrapeUserTier(site, secret.cookies, lcConfig)
-  if (tier === null) {
+  const { tier: lcTier, lcTierMismatch } = await scrapeLcUserTier(secret.cookies, lcConfig)
+  if (lcTier === null) {
     return { ok: false, error: 'Tier check inconclusive.' }
   }
 
   // Update the in-memory cache.
-  tierCache[site] = tier
+  lcTierCache = lcTier
 
-  // Re-read the live entry before persisting. verifyTier can run concurrently
+  // Re-read the live entry before persisting. verifyLcTier can run concurrently
   // with ensureFreshCookies / removeAccount (main.js launches both at startup
   // unawaited), so the snapshot taken above may be stale. Merge only the tier
   // into the *current* entry; never write back the pre-await cookies (which
   // would log a just-refreshed user out) or resurrect a removed account.
-  const liveEntry = store[site]
+  const liveEntry = store.lewdcorner
   if (!liveEntry) return { ok: false, error: 'Account removed during tier check.' }
   const liveSecret = readSecret(liveEntry)
   if (!liveSecret) return { ok: false, error: 'Credentials lost during tier check.' }
 
-  store[site] = {
+  store.lewdcorner = {
     username: liveEntry.username,
     method: liveEntry.method,
     secretEnc: encrypt(JSON.stringify({
       password: liveSecret.password || null,
       cookies: liveSecret.cookies,
-      tier,
+      tier: lcTier,
       tierCheckedAt: Date.now(),
     })),
     updatedAt: liveEntry.updatedAt,
@@ -402,23 +404,7 @@ async function verifyTier(site, { force = false } = {}) {
   persist()
   rebuildCookieCache()
 
-  return { ok: true, tier, lcTierMismatch }
-}
-
-// Run verifyTier for the LewdCorner account. Called on startup and periodically.
-// Tier detection is lewdcorner-only (see verifyTier), so this never touches the
-// other sites' shops.
-async function verifyAllTiers() {
-  const results = {}
-  for (const site of Object.keys(store)) {
-    if (site !== 'lewdcorner') continue
-    try {
-      results[site] = await verifyTier(site)
-    } catch (err) {
-      results[site] = { ok: false, error: err.message }
-    }
-  }
-  return results
+  return { ok: true, tier: lcTier, lcTierMismatch }
 }
 
 module.exports = {
@@ -430,10 +416,9 @@ module.exports = {
   removeAccount,
   getCookieHeaderForUrl,
   refererForUrl,
-  getUserTier,
+  getLcUserTier,
   ensureFreshCookies,
   refreshAllAccounts,
-  verifyTier,
-  verifyAllTiers,
+  verifyLcTier,
   siteForUrl,
 }

@@ -21,19 +21,17 @@ const Accounts = () => {
     try {
       const list = await window.electronAPI.listAccounts()
       setAccounts(Array.isArray(list) ? list : [])
-      // Fetch tier for each connected LC account.
-      const newTiers = {}
-      for (const a of Array.isArray(list) ? list : []) {
-        if (a.connected && a.site === 'lewdcorner') {
-          try {
-            const t = await window.electronAPI.getUserTier({ site: a.site })
-            newTiers[a.site] = t?.tier || null
-          } catch (_) {
-            newTiers[a.site] = null
-          }
+      // Fetch tier for the connected LewdCorner account.
+      const newLcTiers = {}
+      if (Array.isArray(list) && list.some((a) => a.connected && a.site === 'lewdcorner')) {
+        try {
+          const t = await window.electronAPI.getLcUserTier()
+          newLcTiers.lewdcorner = t?.tier || null
+        } catch (_) {
+          newLcTiers.lewdcorner = null
         }
       }
-      setTiers(newTiers)
+      setTiers(newLcTiers)
     } catch (err) {
       console.error('Failed to load accounts:', err)
       setAccounts([])
@@ -240,12 +238,12 @@ const AddAccountModal = ({ sites, initialSite = null, onClose, onSaved }) => {
     try {
       const result = await window.electronAPI.saveAccount({ site })
       if (result?.ok) {
-        // For LC, scrape the tier immediately so the badge appears without
+        // For LewdCorner, scrape the tier immediately so the badge appears without
         // requiring a navigate-away-and-back to pick up the background result.
         let initialTier = null
         if (site === 'lewdcorner') {
           try {
-            const t = await window.electronAPI.getUserTier({ site, forceRefresh: true })
+            const t = await window.electronAPI.getLcUserTier({ forceRefresh: true })
             initialTier = t?.tier || null
           } catch (_) { /* non-fatal — badge just won't show yet */ }
         }

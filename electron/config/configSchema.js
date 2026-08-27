@@ -226,14 +226,18 @@ const buildDefaultConfig = (dataDir = '') => ({
   // still needs a code edit to the parser.
   LewdCorner: {
     // Member-gated thread probed as a fallback when the shop page is
-    // unreachable or its parser yields no confident answer.
-    probeThreadUrl: 'https://lewdcorner.com/threads/17729',
-    shopUrl: 'https://lewdcorner.com/shop/index.php',
-    shopPrestigeUrl: 'https://lewdcorner.com/shop/index.php?rank_bundle=prestige',
+    // unreachable or its parser yields no confident answer. Stored as a bare
+    // thread id (combined with the site base URL at runtime) so the config
+    // never advertises a clickable link.
+    lcProbeThreadId: 14057,
+    // Shop paths are stored without the site origin and combined with the base
+    // URL at runtime, keeping the config free of full clickable URLs.
+    lcUserTierPath: '/shop/index.php',
+    lcUserPrestigePath: '/shop/index.php?rank_bundle=prestige',
     // Container + owned-token for the rank ownership pill.
-    statusPillClass: 'statusPill',
-    statusPillOwnedToken: 'owned',
-    statusPillOwnedText: 'owned',
+    lcStatusPillClass: 'statusPill',
+    lcStatusPillOwnedToken: 'owned',
+    lcStatusPillOwnedText: 'owned',
     // How fresh the cached membership tier must be, in hours, before a re-scrape
     // is skipped. The tier is scraped (a few requests) then held in the encrypted
     // account blob keyed to tierCheckedAt; whenever a recheck — on startup, on the
@@ -244,7 +248,7 @@ const buildDefaultConfig = (dataDir = '') => ({
     // from the last successful check, not a fixed time of day. A promotion
     // (Standard → Plus) is only noticed on the next recheck, and re-linking the
     // account always forces a fresh scrape regardless of freshness.
-    tierRecheckHours: 24,
+    lcTierRecheckHours: 24,
   },
   WindowBounds: {},
 })

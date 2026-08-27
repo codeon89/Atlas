@@ -7,7 +7,7 @@ import Accounts from '../src/components/settings/Accounts.jsx'
 //
 // When a user connects a LewdCorner account, the tier should be scraped
 // immediately (forceRefresh: true) so the badge shows without requiring a
-// navigate-away-and-back. This tests that the handleAdd flow calls getUserTier
+// navigate-away-and-back. This tests that the handleAdd flow calls getLcUserTier
 // with forceRefresh after a successful save, and that the resulting tier badge
 // actually renders.
 
@@ -18,7 +18,7 @@ const mockAPI = (overrides = {}) => {
   let accounts = overrides.accounts || []
   const api = {
     listAccounts: async () => accounts,
-    getUserTier: async () => ({ tier: overrides.tier || null }),
+    getLcUserTier: async () => ({ tier: overrides.tier || null }),
     saveAccount: async ({ site }) => {
       if (site === 'lewdcorner') {
         accounts = [...accounts, { site, connected: true, username: 'testuser' }]
@@ -48,9 +48,9 @@ function lcConnectButton() {
   return buttons[buttons.length - 1]
 }
 
-test('LC connect calls getUserTier with forceRefresh: true after save', async () => {
+test('LC connect calls getLcUserTier with forceRefresh: true after save', async () => {
   const api = mockAPI({ tier: 'VIP' })
-  const getUserTierSpy = vi.spyOn(api, 'getUserTier')
+  const getLcUserTierSpy = vi.spyOn(api, 'getLcUserTier')
 
   await act(async () => { render(<Accounts />) })
 
@@ -69,8 +69,8 @@ test('LC connect calls getUserTier with forceRefresh: true after save', async ()
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Add account' })) })
 
   await waitFor(() => {
-    expect(getUserTierSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ site: 'lewdcorner', forceRefresh: true }),
+    expect(getLcUserTierSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ forceRefresh: true }),
     )
   })
 
@@ -78,9 +78,9 @@ test('LC connect calls getUserTier with forceRefresh: true after save', async ()
   await screen.findByText('Plus')
 })
 
-test('non-LC connect does NOT call getUserTier with forceRefresh', async () => {
+test('non-LC connect does NOT call getLcUserTier with forceRefresh', async () => {
   const api = mockAPI({ tier: null })
-  const getUserTierSpy = vi.spyOn(api, 'getUserTier')
+  const getLcUserTierSpy = vi.spyOn(api, 'getLcUserTier')
 
   await act(async () => { render(<Accounts />) })
 
@@ -104,7 +104,7 @@ test('non-LC connect does NOT call getUserTier with forceRefresh', async () => {
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Add account' })) })
 
   await waitFor(() => {
-    const forceCall = getUserTierSpy.mock.calls.find(
+    const forceCall = getLcUserTierSpy.mock.calls.find(
       (c) => c[0]?.forceRefresh === true,
     )
     expect(forceCall).toBeUndefined()

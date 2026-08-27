@@ -17,7 +17,7 @@ import { test, expect, vi, describe, beforeEach } from 'vitest'
 const axios = require('axios')
 const mod = require('../electron/accounts/xenforoAuth.js')
 
-const { scrapeTierFromShopPage, probeTierFromThread, scrapeUserTier, LC_RANK_IDS } = mod
+const { scrapeLcTierFromProfile, probeLcTierFromThread, scrapeLcUserTier, LC_RANK_IDS } = mod
 
 const DUMMY_COOKIES = [{ name: 'xf_user', value: '1', domain: 'lewdcorner.com', path: '/' }]
 
@@ -25,7 +25,7 @@ function mockGet(handler) {
   vi.spyOn(axios, 'get').mockImplementation(async (url, _opts) => handler(url))
 }
 
-function shopPageHtml(overrides = {}) {
+function lcTierPageHtml(overrides = {}) {
   const cards = [
     { id: 18, name: 'UwU', owned: overrides.uwuOwned || false },
     { id: 12, name: 'members+ (Donator)', owned: overrides.donatorOwned || false },
@@ -45,42 +45,38 @@ function shopPageHtml(overrides = {}) {
   return `<html><body><div class="rankGrid">${rankCards}</div></body></html>`
 }
 
-// ── scrapeTierFromShopPage ─────────────────────────────────────────────────
+// ── scrapeLcTierFromProfile ─────────────────────────────────────────────────
 
-describe('scrapeTierFromShopPage', () => {
+describe('scrapeLcTierFromProfile', () => {
   beforeEach(() => vi.restoreAllMocks())
 
   test('returns VIP when a VIP-granting rank is owned', async () => {
-    mockGet(() => ({ status: 200, data: shopPageHtml({ donatorOwned: true }) }))
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES)).toBe('VIP')
+    mockGet(() => ({ status: 200, data: lcTierPageHtml({ donatorOwned: true }) }))
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES)).toBe('VIP')
   })
 
   test('returns Free when only UwU is owned', async () => {
-    mockGet(() => ({ status: 200, data: shopPageHtml({ uwuOwned: true }) }))
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES)).toBe('Free')
+    mockGet(() => ({ status: 200, data: lcTierPageHtml({ uwuOwned: true }) }))
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES)).toBe('Free')
   })
 
   test('returns Free when no ranks are owned', async () => {
-    mockGet(() => ({ status: 200, data: shopPageHtml() }))
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES)).toBe('Free')
+    mockGet(() => ({ status: 200, data: lcTierPageHtml() }))
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES)).toBe('Free')
   })
 
   test('returns VIP for Prestige rank ownership', async () => {
-    mockGet(() => ({ status: 200, data: shopPageHtml({ prestige1Owned: true }) }))
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES)).toBe('VIP')
-  })
-
-  test('returns null for unknown site', async () => {
-    expect(await scrapeTierFromShopPage('unknown', DUMMY_COOKIES)).toBeNull()
+    mockGet(() => ({ status: 200, data: lcTierPageHtml({ prestige1Owned: true }) }))
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES)).toBe('VIP')
   })
 
   test('returns null when shop page returns non-200 (inconclusive)', async () => {
     mockGet(() => ({ status: 403, data: '' }))
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES)).toBeNull()
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES)).toBeNull()
   })
 
   test('returns null with empty cookies', async () => {
-    expect(await scrapeTierFromShopPage('lewdcorner', [])).toBeNull()
+    expect(await scrapeLcTierFromProfile([])).toBeNull()
   })
 
   test('checks both main shop and prestige bundle URLs', async () => {
@@ -88,11 +84,11 @@ describe('scrapeTierFromShopPage', () => {
     mockGet((url) => {
       urls.push(url)
       if (url.includes('rank_bundle=prestige')) {
-        return { status: 200, data: shopPageHtml({ prestige5Owned: true }) }
+        return { status: 200, data: lcTierPageHtml({ prestige5Owned: true }) }
       }
-      return { status: 200, data: shopPageHtml() }
+      return { status: 200, data: lcTierPageHtml() }
     })
-    const result = await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES)
+    const result = await scrapeLcTierFromProfile(DUMMY_COOKIES)
     expect(result).toBe('VIP')
     expect(urls.length).toBeGreaterThanOrEqual(2)
     expect(urls[1]).toContain('rank_bundle=prestige')
@@ -103,9 +99,9 @@ describe('scrapeTierFromShopPage', () => {
     mockGet(() => {
       callCount++
       if (callCount === 1) throw new Error('network error')
-      return { status: 200, data: shopPageHtml() }
+      return { status: 200, data: lcTierPageHtml() }
     })
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES)).toBe('Free')
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES)).toBe('Free')
   })
 
   test('detects an owned rank from its owned statusPill (verified LC markup)', async () => {
@@ -116,7 +112,7 @@ describe('scrapeTierFromShopPage', () => {
         <div class="checkout"><button class="buyBtn" data-item-id="13" disabled="">Owned</button></div>
       </div>`
     mockGet(() => ({ status: 200, data: html }))
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES)).toBe('VIP')
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES)).toBe('VIP')
   })
 
   test('treats an available statusPill as not owned', async () => {
@@ -127,7 +123,7 @@ describe('scrapeTierFromShopPage', () => {
         <div class="checkout"><button class="buyBtn" data-item-id="13">Purchase Rank</button></div>
       </div>`
     mockGet(() => ({ status: 200, data: html }))
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES)).toBe('Free')
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES)).toBe('Free')
   })
 
   test('a custom lcConfig with renamed statusPill class/token still detects ownership', async () => {
@@ -139,24 +135,24 @@ describe('scrapeTierFromShopPage', () => {
         <div class="rankBody"><h3>members+</h3></div>
       </div>`
     const lcConfig = {
-      statusPillClass: 'tierBadge',
-      statusPillOwnedToken: 'highlight',
+      lcStatusPillClass: 'tierBadge',
+      lcStatusPillOwnedToken: 'highlight',
     }
     mockGet(() => ({ status: 200, data: html }))
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES, lcConfig)).toBe('VIP')
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES, lcConfig)).toBe('VIP')
   })
 
   test('blank lcConfig keys fall back to built-in defaults', async () => {
-    mockGet(() => ({ status: 200, data: shopPageHtml({ donatorOwned: true }) }))
+    mockGet(() => ({ status: 200, data: lcTierPageHtml({ donatorOwned: true }) }))
     // All blank — the default statusPill/owned selectors must still match.
-    const lcConfig = { statusPillClass: '', statusPillOwnedToken: '', statusPillOwnedText: '' }
-    expect(await scrapeTierFromShopPage('lewdcorner', DUMMY_COOKIES, lcConfig)).toBe('VIP')
+    const lcConfig = { lcStatusPillClass: '', lcStatusPillOwnedToken: '', lcStatusPillOwnedText: '' }
+    expect(await scrapeLcTierFromProfile(DUMMY_COOKIES, lcConfig)).toBe('VIP')
   })
 })
 
-// ── probeTierFromThread ────────────────────────────────────────────────────
+// ── probeLcTierFromThread ────────────────────────────────────────────────────
 
-describe('probeTierFromThread', () => {
+describe('probeLcTierFromThread', () => {
   beforeEach(() => vi.restoreAllMocks())
 
   test('returns Free when attachment-hide block is present', async () => {
@@ -164,7 +160,7 @@ describe('probeTierFromThread', () => {
       status: 200,
       data: '<html><body><div class="messageHide messageHide--attach">You must be registered to see attachments</div></body></html>',
     }))
-    expect(await probeTierFromThread('lewdcorner', DUMMY_COOKIES)).toBe('Free')
+    expect(await probeLcTierFromThread(DUMMY_COOKIES)).toBe('Free')
   })
 
   test('returns VIP when attachment content is visible', async () => {
@@ -172,7 +168,7 @@ describe('probeTierFromThread', () => {
       status: 200,
       data: '<html><body><div class="message-attachment"><img class="bbImage" src="test.jpg"></div></body></html>',
     }))
-    expect(await probeTierFromThread('lewdcorner', DUMMY_COOKIES)).toBe('VIP')
+    expect(await probeLcTierFromThread(DUMMY_COOKIES)).toBe('VIP')
   })
 
   test('returns null when thread loads but no attachment indicators', async () => {
@@ -180,40 +176,35 @@ describe('probeTierFromThread', () => {
       status: 200,
       data: '<html><body><div class="message-body">Just text, no attachments here.</div></body></html>',
     }))
-    expect(await probeTierFromThread('lewdcorner', DUMMY_COOKIES)).toBeNull()
+    expect(await probeLcTierFromThread(DUMMY_COOKIES)).toBeNull()
   })
 
   test('returns null on network error', async () => {
     mockGet(() => { throw new Error('timeout') })
-    expect(await probeTierFromThread('lewdcorner', DUMMY_COOKIES)).toBeNull()
+    expect(await probeLcTierFromThread(DUMMY_COOKIES)).toBeNull()
   })
 
   test('returns null on non-200 status', async () => {
     mockGet(() => ({ status: 404, data: '' }))
-    expect(await probeTierFromThread('lewdcorner', DUMMY_COOKIES)).toBeNull()
-  })
-
-  test('returns null for site without a probe thread', async () => {
-    mockGet(() => ({ status: 200, data: '' }))
-    expect(await probeTierFromThread('f95', DUMMY_COOKIES)).toBeNull()
+    expect(await probeLcTierFromThread(DUMMY_COOKIES)).toBeNull()
   })
 
   test('returns null with empty cookies', async () => {
-    expect(await probeTierFromThread('lewdcorner', [])).toBeNull()
+    expect(await probeLcTierFromThread([])).toBeNull()
   })
 })
 
-// ── scrapeUserTier ─────────────────────────────────────────────────────────
+// ── scrapeLcUserTier ─────────────────────────────────────────────────────────
 
-describe('scrapeUserTier', () => {
+describe('scrapeLcUserTier', () => {
   beforeEach(() => vi.restoreAllMocks())
 
   test('returns VIP when shop page shows owned VIP rank', async () => {
     mockGet(() => ({
       status: 200,
-      data: shopPageHtml({ membersPlusOwned: true }),
+      data: lcTierPageHtml({ membersPlusOwned: true }),
     }))
-    const { tier, lcTierMismatch } = await scrapeUserTier('lewdcorner', DUMMY_COOKIES)
+    const { tier, lcTierMismatch } = await scrapeLcUserTier(DUMMY_COOKIES)
     expect(tier).toBe('VIP')
     expect(lcTierMismatch).toBe(false)
   })
@@ -223,14 +214,14 @@ describe('scrapeUserTier', () => {
     mockGet(() => {
       callCount++
       if (callCount <= 2) {
-        return { status: 200, data: shopPageHtml() }
+        return { status: 200, data: lcTierPageHtml() }
       }
       return {
         status: 200,
         data: '<div class="messageHide messageHide--attach">You must be registered</div>',
       }
     })
-    const { tier, lcTierMismatch } = await scrapeUserTier('lewdcorner', DUMMY_COOKIES)
+    const { tier, lcTierMismatch } = await scrapeLcUserTier(DUMMY_COOKIES)
     expect(tier).toBe('Free')
     expect(lcTierMismatch).toBe(false)
   })
@@ -245,7 +236,7 @@ describe('scrapeUserTier', () => {
         data: '<div class="message-attachment"><img class="bbImage"></div>',
       }
     })
-    const { tier, lcTierMismatch } = await scrapeUserTier('lewdcorner', DUMMY_COOKIES)
+    const { tier, lcTierMismatch } = await scrapeLcUserTier(DUMMY_COOKIES)
     expect(tier).toBe('VIP')
     // Shop outage is not a parser bug, so this must NOT be flagged as a mismatch.
     expect(lcTierMismatch).toBe(false)
@@ -253,16 +244,16 @@ describe('scrapeUserTier', () => {
 
   test('returns null when all methods fail', async () => {
     mockGet(() => { throw new Error('network error') })
-    const { tier } = await scrapeUserTier('lewdcorner', DUMMY_COOKIES)
+    const { tier } = await scrapeLcUserTier(DUMMY_COOKIES)
     expect(tier).toBeNull()
   })
 
   test('returns VIP immediately when shop page shows VIP (skips thread probe)', async () => {
     mockGet(() => ({
       status: 200,
-      data: shopPageHtml({ prestige5Owned: true }),
+      data: lcTierPageHtml({ prestige5Owned: true }),
     }))
-    const { tier, lcTierMismatch } = await scrapeUserTier('lewdcorner', DUMMY_COOKIES)
+    const { tier, lcTierMismatch } = await scrapeLcUserTier(DUMMY_COOKIES)
     expect(tier).toBe('VIP')
     expect(lcTierMismatch).toBe(false)
     expect(axios.get).toHaveBeenCalledTimes(1)
@@ -276,14 +267,14 @@ describe('scrapeUserTier', () => {
     mockGet(() => {
       callCount++
       if (callCount <= 2) {
-        return { status: 200, data: shopPageHtml() }
+        return { status: 200, data: lcTierPageHtml() }
       }
       return {
         status: 200,
         data: '<div class="message-attachment"><img class="bbImage"></div>',
       }
     })
-    const { tier, lcTierMismatch } = await scrapeUserTier('lewdcorner', DUMMY_COOKIES)
+    const { tier, lcTierMismatch } = await scrapeLcUserTier(DUMMY_COOKIES)
     expect(tier).toBe('VIP')
     expect(lcTierMismatch).toBe(true)
   })
@@ -316,50 +307,53 @@ describe('tier logic is isolated to lewdcorner', () => {
     'utf8',
   )
 
-  test('verifyAllTiers only iterates the lewdcorner site', () => {
-    const fn = source.slice(
-      source.indexOf('async function verifyAllTiers'),
-      source.indexOf('module.exports'),
-    )
-    // Must select only lewdcorner, never sweep the generic SITES list.
-    expect(fn).toMatch(/site\s*!==\s*['"]lewdcorner['"]|verifyAllTiers.*lewdcorner/)
-    expect(fn).not.toMatch(/SITES\s*\[site\]/)
+  test('verifyLcTier is LewdCorner-only and takes no site param', () => {
+    expect(source).toContain('async function verifyLcTier')
+    expect(source).not.toContain('async function verifyTier')
+    expect(source).not.toContain('async function verifyAllTiers')
+    // Uses lcTierCache scalar, not a per-site tierCache map
+    expect(source).toContain('lcTierCache')
+    expect(source).not.toMatch(/tierCache\[site\]/)
+    // Reads/writes only the lewdcorner store entry
+    expect(source).toContain('store.lewdcorner')
   })
 
-  test('verifyTier rejects any site other than lewdcorner', () => {
+  test('getLcUserTier takes no site param and reads lcTierCache', () => {
     const fn = source.slice(
-      source.indexOf('async function verifyTier'),
-      source.indexOf('async function verifyAllTiers'),
+      source.indexOf('function getLcUserTier'),
+      source.indexOf('function listAccounts'),
     )
-    expect(fn).toMatch(/site\s*!==\s*['"]lewdcorner['"]/)
+    expect(fn).toMatch(/function getLcUserTier\(\)/)
+    expect(fn).toContain('lcTierCache')
+    expect(fn).not.toContain('site')
   })
 })
 
-// ── Config: tierRecheckHours ───────────────────────────────────────────────
+// ── Config: lcTierRecheckHours ───────────────────────────────────────────────
 //
 // The freshness window is config-driven. Default 24; coerced to a number from
 // the ini string; blank/absent falls back to the default.
 
-describe('[LewdCorner] tierRecheckHours config', () => {
+describe('[LewdCorner] lcTierRecheckHours config', () => {
   const { buildDefaultConfig, mergeWithDefaults } = require('../electron/config/configSchema')
 
   test('defaults to 24 in the config schema', () => {
-    expect(buildDefaultConfig().LewdCorner.tierRecheckHours).toBe(24)
+    expect(buildDefaultConfig().LewdCorner.lcTierRecheckHours).toBe(24)
   })
 
   test('coerces a string from the ini to a number', () => {
     const merged = mergeWithDefaults(
-      { LewdCorner: { tierRecheckHours: '12' } },
+      { LewdCorner: { lcTierRecheckHours: '12' } },
       { LewdCorner: buildDefaultConfig().LewdCorner },
     )
-    expect(merged.LewdCorner.tierRecheckHours).toBe(12)
+    expect(merged.LewdCorner.lcTierRecheckHours).toBe(12)
   })
 
   test('falls back to the default for a non-numeric value', () => {
     const merged = mergeWithDefaults(
-      { LewdCorner: { tierRecheckHours: 'soon' } },
+      { LewdCorner: { lcTierRecheckHours: 'soon' } },
       { LewdCorner: buildDefaultConfig().LewdCorner },
     )
-    expect(merged.LewdCorner.tierRecheckHours).toBe(24)
+    expect(merged.LewdCorner.lcTierRecheckHours).toBe(24)
   })
 })

@@ -342,24 +342,22 @@ function registerLewdCornerMediaHeaders() {
   registerMediaAuthHeaders()
 }
 
-// Dev-only diagnostic for the LewdCorner tier check. When a verifyAllTiers()
-// result reports lcTierMismatch, the LewdCorner shop page parser read no owned
+// Dev-only diagnostic for the LewdCorner tier check. When verifyLcTier()
+// reports lcTierMismatch, the LewdCorner shop page parser read no owned
 // rank but the thread probe — which reflects real content access — concluded
 // the user is Plus. That mismatch is the stale-selector signal: the [LewdCorner]
 // config keys (statusPillClass / statusPillOwnedToken / statusPillOwnedText)
 // likely no longer match LC's markup. Gated on !app.isPackaged so it never
 // fires in a shipped build; the user-facing tier gate stays correct regardless
 // because the probe already resolved the real tier.
-function warnOnTierMismatch(results) {
-  if (app.isPackaged || !results) return
-  for (const [site, r] of Object.entries(results)) {
-    if (r && r.lcTierMismatch === true) {
-      console.warn(
-        `[${site}] LewdCorner shop parser looks stale: shop reported 'Free' but ` +
-        'the thread probe confirmed real content access. Check the [LewdCorner] ' +
-        'statusPill selectors in the config.',
-      )
-    }
+function warnOnLcTierMismatch(result) {
+  if (app.isPackaged || !result) return
+  if (result.lcTierMismatch === true) {
+    console.warn(
+      'LewdCorner shop parser looks stale: shop reported \'Free\' but ' +
+      'the thread probe confirmed real content access. Check the [LewdCorner] ' +
+      'statusPill selectors in the config.',
+    )
   }
 }
 
@@ -2309,25 +2307,25 @@ app.whenReady().then(async () => {
     )
     // Tier verification: scrape LC membership tier after cookies are fresh.
     // Runs in the background on startup and periodically. The recheck interval
-    // reads tierRecheckHours from config (default 24h); a recheck that finds the
-    // cached tier still fresh is skipped inside verifyTier, so this only scrapes
+    // reads lcTierRecheckHours from config (default 24h); a recheck that finds the
+    // cached tier still fresh is skipped inside verifyLcTier, so this only scrapes
     // when actually stale. Re-linking the account re-triggers it immediately via
-    // commitAccount's forced verifyTier.
-    const tierRecheckHours = Number(appConfig?.LewdCorner?.tierRecheckHours)
-    const tierRecheckInterval =
-      (Number.isFinite(tierRecheckHours) ? tierRecheckHours : 24) * 60 * 60 * 1000
-    const runTierCheck = () =>
-      accountStore.verifyAllTiers().then((results) => {
-        warnOnTierMismatch(results)
+    // commitAccount's forced verifyLcTier.
+    const lcTierRecheckHours = Number(appConfig?.LewdCorner?.lcTierRecheckHours)
+    const lcTierRecheckInterval =
+      (Number.isFinite(lcTierRecheckHours) ? lcTierRecheckHours : 24) * 60 * 60 * 1000
+    const runLcTierCheck = () =>
+      accountStore.verifyLcTier().then((result) => {
+        warnOnLcTierMismatch(result)
       })
-    runTierCheck().catch((err) =>
+    runLcTierCheck().catch((err) =>
       console.warn('Initial tier check failed:', err.message),
     )
     setInterval(() => {
-      runTierCheck().catch((err) =>
+      runLcTierCheck().catch((err) =>
         console.warn('Periodic tier check failed:', err.message),
       )
-    }, tierRecheckInterval)
+    }, lcTierRecheckInterval)
   } catch (err) {
     console.warn('Account store init failed:', err.message)
   }
