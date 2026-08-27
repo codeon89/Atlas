@@ -6,7 +6,7 @@
 
   
 ### Added
-- LewdCorner member tier detection. Atlas now scrapes your LewdCorner account's shop page to determine your membership tier (Standard / Plus / non-logged in) and stores it alongside your credentials. Browse filters content by tier so Plus users see everything while Standard or non-login users only see what their subscription allows. Tier is shown immediately on first connect, rechecked periodically (configurable via `tierRecheckHours`), and forced on re-link. A dev-only console warning fires when the scraped tier disagrees with the stored value. (`electron/accounts/xenforoAuth.js`, `electron/accounts/accountStore.js`, `electron/db/catalogIndex.js`, `src/components/settings/Accounts.jsx`)
+
 
 ### Changed
 - Custom media uploads in the Game Details Media tab: add preview images from local files, a drag-and-drop zone, or an image URL, with live progress. Previews can be reordered by drag and the order persists in a new `preview_sort` table keyed by remote URL (or relative path for custom uploads), so it survives re-downloads, stream/download switches and metadata refreshes. Previews now carry a source logo and a storage-location badge, and custom previews can be deleted independently of downloaded ones.

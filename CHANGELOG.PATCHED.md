@@ -1,6 +1,7 @@
 # Changelog - PATCHED
 
 ## Fork's Nightly Changes
+- LewdCorner member tier detection. Atlas now scrapes your LewdCorner account's shop page to determine your membership tier (Standard / Plus) and stores it alongside your credentials. Browse filters content by tier so Plus users see everything while Standard or non-login users only see what their subscription allows.[PR#391](https://github.com/towerwatchman/Atlas/pull/391)
 - Fix multiple executable chooser rendering logic, and redo the executable chooser UI.[PR#389](https://github.com/towerwatchman/Atlas/pull/389)
 - Fixed bat file launcher for Atlas.[PR#388](https://github.com/towerwatchman/Atlas/pull/388)
 - Allow setting folder and program locations by typing or paste a path directly besides using Browse / Select Folder button.[PR#385](https://github.com/towerwatchman/Atlas/pull/385)
