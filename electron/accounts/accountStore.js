@@ -108,6 +108,14 @@ function rebuildCookieCache() {
     if (secret && Array.isArray(secret.cookies)) {
       cookieHeaderCache[site] = cookieHeaderFromArray(secret.cookies)
     }
+    if (secret && secret.tier) {
+      tierCache[site] = secret.tier
+    }
+  }
+  const lcEntry = store.lewdcorner
+  if (lcEntry) {
+    const secret = readSecret(lcEntry)
+    if (secret && secret.tier) lcTierCache = secret.tier
   }
   const lcEntry = store.lewdcorner
   if (lcEntry) {
