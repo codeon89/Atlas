@@ -117,6 +117,11 @@ function rebuildCookieCache() {
     const secret = readSecret(lcEntry)
     if (secret && secret.tier) lcTierCache = secret.tier
   }
+  const lcEntry = store.lewdcorner
+  if (lcEntry) {
+    const secret = readSecret(lcEntry)
+    if (secret && secret.tier) lcTierCache = secret.tier
+  }
 }
 
 function init(dataDir, lewdcornerConfig) {
