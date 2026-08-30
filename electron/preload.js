@@ -68,6 +68,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     console.log("Invoking selectDirectory");
     return ipcRenderer.invoke("select-directory", options);
   },
+  checkPath: (p) => ipcRenderer.invoke("check-path", p),
   getVersion: () => ipcRenderer.invoke("get-version"),
   openSettings: (options) => ipcRenderer.invoke("open-settings", options),
   onStartSettingsTour: (cb) => {
@@ -658,6 +659,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   verifyAccountBrowser: (payload) => ipcRenderer.invoke("accounts-verify-browser", payload),
   saveAccount: (payload) => ipcRenderer.invoke("accounts-save", payload),
   removeAccount: (payload) => ipcRenderer.invoke("accounts-remove", payload),
+  getLcUserTier: (payload) => ipcRenderer.invoke("lewdcorner-tier", payload),
 
   // ── Steam (owned library) ───────────────────────────────────────────────
   steamStatus: () => ipcRenderer.invoke("steam-status"),
