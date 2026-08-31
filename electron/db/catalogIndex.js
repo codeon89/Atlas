@@ -46,6 +46,9 @@ const {
   indexColumnsForSearchFieldIds, normalizeSearchFieldIds,
 } = require('./searchFields')
 const { extractUrlId } = require('./urlIdExtractor')
+const { buildTagsFilterValue, normalizeTagText, normalizeTagList, splitTagSources } = require('./tagTokens')
+const { tokenPredicate, escapeLike } = require('./tagFilterSql')
+const { getLcUserTier } = require('../accounts/accountStore')
 
 // A search payload may carry `fields` (current) or `type` (legacy). Neither
 // present means the caller wants the default set.
@@ -65,7 +68,13 @@ const { withTransaction, isWriteLockBusy } = require('./writeLock')
 // from external_ids, so a bump is what makes an existing install pick the
 // new columns up instead of keeping a schema-4 table with every appid
 // typed as a game.
-const CATALOG_INDEX_VERSION = 5
+
+// 6: catalog_index gained tags_filter (comma-joined normalized tokens) + catalog_index_tags
+// indexed tag map for fast exact-token filtering (LIKE with leading wildcard
+// cannot use an index) so the tag include/exclude filter is exact-token rather
+// than substring over tags_text. Reuses the ADD-COLUMN path so existing installs
+// migrate without a full DROP/CREATE.
+const CATALOG_INDEX_VERSION = 6
 
 const CHUNK_SIZE = 2000
 
@@ -293,6 +302,7 @@ const CATALOG_INDEX_DDL = [
      censored         TEXT,
      language         TEXT,
      tags_text        TEXT,
+     tags_filter      TEXT,
      search_text      TEXT,
      site_url         TEXT,
      rating_best      REAL,
@@ -322,6 +332,12 @@ const CATALOG_INDEX_DDL = [
      is_dlc       INTEGER NOT NULL DEFAULT 0,
      parent_appid INTEGER,
      PRIMARY KEY (steam_appid, atlas_id)
+   );`,
+
+  `CREATE TABLE IF NOT EXISTS catalog_index_tags (
+     catalog_key TEXT NOT NULL,
+     tag         TEXT NOT NULL,
+     PRIMARY KEY (catalog_key, tag)
    );`,
 
   `CREATE TABLE IF NOT EXISTS catalog_index_meta (
@@ -371,6 +387,8 @@ const CATALOG_INDEX_INDEXES = [
   `CREATE INDEX IF NOT EXISTS idx_catalog_index_local_record ON catalog_index(local_record_id);`,
   `CREATE INDEX IF NOT EXISTS idx_atlas_external_steam_atlas
      ON atlas_external_steam(atlas_id);`,
+  `CREATE INDEX IF NOT EXISTS idx_catalog_index_tags_tag
+     ON catalog_index_tags(tag);`,
 ]
 
 // Columns added to a table that already exists on installs in the wild.
@@ -390,6 +408,7 @@ const CATALOG_INDEX_INDEXES = [
 const CATALOG_INDEX_ADDED_COLUMNS = [
   ['atlas_external_steam', 'is_dlc', 'INTEGER NOT NULL DEFAULT 0'],
   ['atlas_external_steam', 'parent_appid', 'INTEGER'],
+  ['catalog_index', 'tags_filter', 'TEXT'],
 ]
 
 // The ALTER statements a database with these columns still needs. Pure, so the
@@ -530,7 +549,7 @@ const rebuildAtlasExternalSteam = async ({ onProgress } = {}) => {
 const CATALOG_INDEX_COLUMNS = [
   'catalog_key', 'record_id', 'source', 'atlas_id', 'steam_id', 'gog_id', 'lc_id',
   'f95_id', 'local_record_id', 'is_installed', 'title', 'short_name', 'creator',
-  'engine', 'category', 'status', 'censored', 'language', 'tags_text', 'search_text',
+  'engine', 'category', 'status', 'censored', 'language', 'tags_text', 'tags_filter', 'search_text',
   'site_url', 'rating_best', 'likes_best',
   'thread_updated_tier', 'thread_updated_ms',
   'thread_publish_tier', 'thread_publish_ms',
@@ -603,6 +622,7 @@ const projectAtlasRow = (row, nowMs) => {
     row.censored ?? null,
     row.language ?? null,
     joinText(row.atlas_tags, row.f95_tags, row.lc_tags, row.lc_prefixes),
+    buildTagsFilterValue(row.atlas_tags, row.f95_tags, row.lc_tags, row.lc_prefixes),
     joinText(title, row.short_name, row.creator, row.engine, row.status, row.category),
     row.f95_site_url || row.lc_site_url || null,
     bestOf(row.f95_rating, row.lc_rating),
@@ -623,6 +643,28 @@ const insertProjectedRows = async (rows) => {
     const slice = rows.slice(i, i + 500)
     await dbRun(
       `INSERT OR REPLACE INTO catalog_index (${cols}) VALUES ${slice.map(() => one).join(', ')}`,
+      slice.flat())
+  }
+}
+
+// Why a separate tag table: `tags_filter LIKE '%,token,%'` has a leading
+// wildcard so no B-tree index on `tags_filter` can be used — it scans the
+// whole table and concatenates per row. An indexed `catalog_index_tags(tag)`
+// lets `EXISTS (SELECT 1 ... WHERE tag=?)` hit the index instead.
+const insertCatalogIndexTags = async (rows) => {
+  const tagRows = []
+  for (const r of rows) {
+    const key = r[0]
+    const filter = r[19]
+    if (!filter) continue
+    const tags = String(filter).split(',').map((t) => t.trim()).filter(Boolean)
+    for (const tag of tags) tagRows.push([key, tag])
+  }
+  if (tagRows.length === 0) return
+  for (let i = 0; i < tagRows.length; i += 500) {
+    const slice = tagRows.slice(i, i + 500)
+    await dbRun(
+      `INSERT OR IGNORE INTO catalog_index_tags (catalog_key, tag) VALUES ${slice.map(() => '(?, ?)').join(', ')}`,
       slice.flat())
   }
 }
@@ -651,6 +693,7 @@ const rebuildCatalogIndex = async ({ onProgress, chunkSize = CHUNK_SIZE } = {}) 
   const total = totalRow?.c || 0
 
   await dbRun('DELETE FROM catalog_index')
+  await dbRun('DELETE FROM catalog_index_tags')
   await setMeta('stale', '1')
   await setMeta('stale_reason', 'rebuild in progress')
 
@@ -667,7 +710,10 @@ const rebuildCatalogIndex = async ({ onProgress, chunkSize = CHUNK_SIZE } = {}) 
     // One transaction PER CHUNK, taken under the shared write lock. The lock is
     // released between chunks, so a concurrent catalog sync interleaves at a
     // transaction boundary instead of committing this one out from under us.
-    await withTransaction('catalogIndex.chunk', dbRun, () => insertProjectedRows(projected))
+    await withTransaction('catalogIndex.chunk', dbRun, async () => {
+      await insertProjectedRows(projected)
+      await insertCatalogIndexTags(projected)
+    })
 
     processed += rows.length
     report({
@@ -725,7 +771,10 @@ const rebuildOrphanBranches = async ({ onProgress, chunkSize, nowMs }) => {
       const rows = await dbAll(pageSql, [chunkSize, offset])
       if (rows.length === 0) break
       const projected = rows.map((row) => project(row, nowMs))
-      await withTransaction(`catalogIndex.${label}`, dbRun, () => insertProjectedRows(projected))
+      await withTransaction(`catalogIndex.${label}`, dbRun, async () => {
+        await insertProjectedRows(projected)
+        await insertCatalogIndexTags(projected)
+      })
       done += rows.length
       report({ phase: label, processed: done, total, message: `Indexing ${label} entries…` })
       await yieldToLoop()
@@ -761,7 +810,7 @@ const rebuildOrphanBranches = async ({ onProgress, chunkSize, nowMs }) => {
         row.local_record_id ?? null, row.local_record_id != null ? 1 : 0,
         title, title, creator, row.engine ?? null, row.category ?? null,
         row.status ?? null, row.censored ?? null, row.language ?? null,
-        joinText(row.tags), joinText(title, creator, row.engine, row.status, row.category),
+        joinText(row.tags), buildTagsFilterValue(row.tags), joinText(title, creator, row.engine, row.status, row.category),
         null, null, null,
         2, null, 2, null, dateTier(releaseMs, now), releaseMs, null, 1,
       ]
@@ -790,7 +839,7 @@ const rebuildOrphanBranches = async ({ onProgress, chunkSize, nowMs }) => {
         row.local_record_id ?? null, row.local_record_id != null ? 1 : 0,
         title, title, creator, row.engine ?? null, row.category ?? null,
         row.status ?? null, row.censored ?? null, row.language ?? null,
-        joinText(row.tags), joinText(title, creator, row.engine, row.status, row.category),
+        joinText(row.tags), buildTagsFilterValue(row.tags), joinText(title, creator, row.engine, row.status, row.category),
         row.store_url ?? null, null, null,
         2, null, 2, null, dateTier(releaseMs, now), releaseMs, null, 0,
       ]
@@ -821,7 +870,7 @@ const rebuildOrphanBranches = async ({ onProgress, chunkSize, nowMs }) => {
         null, null, null, row.lc_id, null,
         row.local_record_id ?? null, row.local_record_id != null ? 1 : 0,
         title, title, FALLBACK_CREATOR, null, null, null, null, null,
-        joinText(row.tags, row.prefixes), joinText(title, FALLBACK_CREATOR),
+        joinText(row.tags, row.prefixes), buildTagsFilterValue(row.tags, row.prefixes), joinText(title, FALLBACK_CREATOR),
         row.site_url ?? null, toNumberOrNull(row.rating), toNumberOrNull(row.likes),
         dateTier(tuMs, now), tuMs, dateTier(tpMs, now), tpMs, 2, null, null, 0,
       ]
@@ -856,11 +905,23 @@ const refreshCatalogIndexForAtlasIds = async (atlasIds = []) => {
 
     await withTransaction('catalogIndex.refresh', dbRun, async () => {
       if (missing.length > 0) {
+        const missingKeys = missing.map((id) => `atlas:${id}`)
         await dbRun(
           `DELETE FROM catalog_index WHERE catalog_key IN (${missing.map(() => '?').join(', ')})`,
-          missing.map((id) => `atlas:${id}`))
+          missingKeys)
+        await dbRun(
+          `DELETE FROM catalog_index_tags WHERE catalog_key IN (${missing.map(() => '?').join(', ')})`,
+          missingKeys)
       }
-      await insertProjectedRows(rows.map((row) => projectAtlasRow(row, nowMs)))
+      const projected = rows.map((row) => projectAtlasRow(row, nowMs))
+      if (projected.length > 0) {
+        const keys = projected.map((r) => r[0])
+        await dbRun(
+          `DELETE FROM catalog_index_tags WHERE catalog_key IN (${keys.map(() => '?').join(', ')})`,
+          keys)
+      }
+      await insertProjectedRows(projected)
+      await insertCatalogIndexTags(projected)
     })
     refreshed += rows.length
     await yieldToLoop()
@@ -937,13 +998,18 @@ const buildIndexWhere = (search = {}, filters = {}) => {
   const parts = []
 
   // ── LewdCorner free-tier gate ─────────────────────────────────────────────
-  // Anything carrying an lc_id is only browsable on the Free tier. Rows with no
-  // LewdCorner linkage are unaffected.
+  // Catalog-listing visibility by USER tier (detected account tier). The stored
+  // user-tier value is 'Free'/'VIP' — the same vocabulary as the content-tier
+  // column — while the Accounts page maps Free→Standard, VIP→Plus for display:
+  //   - 'VIP'         → sees all LC content (gate skipped)
+  //   - 'Free' / null → Standard-content rows only
+  // This gate governs the catalog listing only; the attachment image stream is
+  // gated by the LC server on its request cookies, not by this code.
   //
-  // NULL tier is excluded along with the paid tiers, which is deliberate but
-  // worth knowing: `tier` arrived via ALTER TABLE (see db/index.js), so LC rows
-  // scraped before that migration have no tier and are hidden until a rescrape
-  // fills it in.
+  // Rows carrying a NULL content tier fail `lct.tier = 'Free'` under SQL's
+  // three-valued logic and are hidden the same as 'VIP': the column arrived via
+  // ALTER TABLE (see db/index.js), so LC rows scraped before that migration
+  // have no tier until a rescrape fills it in.
   //
   // Read live from lewdcorner_data through the join rather than copied into
   // catalog_index: no reindex is needed to adopt this, and a rescrape that
@@ -952,10 +1018,15 @@ const buildIndexWhere = (search = {}, filters = {}) => {
   // PK), and it sits in the shared WHERE so the count query and the page query
   // agree — filtering only the page would size the grid's scrollbar for rows it
   // never shows.
-  parts.push(`(ci.lc_id IS NULL OR lct.tier = 'Free')`)
+  //
+  // Not-logged-in (getLcUserTier returns null) is intentionally treated the same
+  // as Standard: an unauthenticated user must not see members-only content. It
+  // flips to full visibility only once tier detection reports 'VIP'.
+  if (getLcUserTier() !== 'VIP') {
+    parts.push(`(ci.lc_id IS NULL OR lct.tier = 'Free')`)
+  }
   const params = []
 
-  const escapeLike = (value) => String(value).replace(/[\\%_]/g, (c) => `\\${c}`)
   const like = (value) => `%${escapeLike(value).toLowerCase()}%`
   const toArray = (value) => {
     if (Array.isArray(value)) {
@@ -1071,20 +1142,26 @@ const buildIndexWhere = (search = {}, filters = {}) => {
     params.push(...languages.map(like))
   }
 
-  // All four tag sources are concatenated into tags_text at index time, so one
-  // LIKE per tag replaces four.
+  // Exact-token tag filter via indexed catalog_index_tags (tag = ? hits idx_catalog_index_tags_tag)
+  // instead of LIKE with leading wildcard on tags_filter (full scan).
   const addTags = (values, { exclude = false, logic = 'AND' } = {}) => {
     const safe = toArray(values)
     if (safe.length === 0) return
-    const clauses = safe.map((value) => {
-      params.push(like(value))
-      const one = `LOWER(COALESCE(ci.tags_text, '')) LIKE ? ESCAPE '\\'`
-      return exclude ? `NOT (${one})` : `(${one})`
-    })
-    parts.push(`(${clauses.join(exclude || logic === 'AND' ? ' AND ' : ' OR ')})`)
+    const perFilterClauses = []
+    for (const value of safe) {
+      const token = normalizeTagText(value).trim()
+      if (!token) continue
+      const existsSql = `EXISTS (SELECT 1 FROM catalog_index_tags cit WHERE cit.catalog_key = ci.catalog_key AND cit.tag = ?)`
+      params.push(token)
+      perFilterClauses.push(exclude ? `NOT ${existsSql}` : existsSql)
+    }
+    if (perFilterClauses.length === 0) return
+    parts.push(`(${perFilterClauses.join(exclude || logic === 'AND' ? ' AND ' : ' OR ')})`)
   }
-  addTags(filters.tags, { logic: filters.tagLogic === 'OR' ? 'OR' : 'AND' })
-  addTags(filters.excludedTags, { exclude: true })
+  const normalizedIncludes = normalizeTagList(filters.tags)
+  const normalizedExcludes = normalizeTagList(filters.excludedTags)
+  addTags(normalizedIncludes, { logic: filters.tagLogic === 'OR' ? 'OR' : 'AND' })
+  addTags(normalizedExcludes, { exclude: true })
 
   if (filters.installState === 'installed') parts.push('ci.is_installed = 1')
   else if (filters.installState === 'uninstalled') parts.push('ci.is_installed = 0')
