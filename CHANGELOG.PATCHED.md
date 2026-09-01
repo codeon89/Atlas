@@ -2,6 +2,7 @@
 
 ## Fork's Nightly Changes
 *Changes that's already on the fork and waiting to be reviewed for merge into original Atlas*
+- Update debounce logic for Browse and Library: Search in Catalog Browse and Library now debounces the text input and waits for a pause before filtering. Previously every keystroke updated `activeFilters.text` and ran `filterGamesWithState` (Library) or scheduled a catalog fetch, causing input lag on large libraries and a wasted local-filter pass even while browsing the server-side catalog. The input still echoes instantly from local state; clear bypasses the delay.[PR#398](https://github.com/towerwatchman/Atlas/pull/398)
 
 ## Independent Changes
 *Any fork-only changes that is not accepted for merged but valid, or independent changes to make the fork repo releasable (e.g. custom version or preventing updates)*
