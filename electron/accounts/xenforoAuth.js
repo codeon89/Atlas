@@ -146,7 +146,7 @@ const LC_RANK_IDS = new Set([2, 6, 7, 8, 12, 13])
 // without config plumbing, and so a markup change can be handled by config.
 const LC_TIER_DEFAULTS = {
   lcProbeThreadId: 14057,
-  lcUserTierPath: '/shop/index.php',
+  lcUserTierPath: '/shop/index.php#user-ranks',
   lcUserPrestigePath: '/shop/index.php?rank_bundle=prestige',
   lcStatusPillClass: 'statusPill',
   lcStatusPillOwnedToken: 'owned',

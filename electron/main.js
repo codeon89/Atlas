@@ -358,6 +358,11 @@ function warnOnLcTierMismatch(result) {
       'the thread probe confirmed real content access. Check the [LewdCorner] ' +
       'statusPill selectors in the config.',
     )
+    return
+  }
+  if (result.ok && result.tier) {
+    const src = result.fromCache ? ' (cached)' : ''
+    console.log(`LewdCorner tier: ${result.tier}${src}`)
   }
 }
 

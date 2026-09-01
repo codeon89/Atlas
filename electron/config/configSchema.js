@@ -232,7 +232,7 @@ const buildDefaultConfig = (dataDir = '') => ({
     lcProbeThreadId: 14057,
     // Shop paths are stored without the site origin and combined with the base
     // URL at runtime, keeping the config free of full clickable URLs.
-    lcUserTierPath: '/shop/index.php',
+    lcUserTierPath: '/shop/index.php#user-ranks',
     lcUserPrestigePath: '/shop/index.php?rank_bundle=prestige',
     // Container + owned-token for the rank ownership pill.
     lcStatusPillClass: 'statusPill',

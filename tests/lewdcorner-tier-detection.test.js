@@ -357,3 +357,23 @@ describe('[LewdCorner] lcTierRecheckHours config', () => {
     expect(merged.LewdCorner.lcTierRecheckHours).toBe(24)
   })
 })
+
+describe('[LewdCorner] shop URL defaults', () => {
+  const { buildDefaultConfig } = require('../electron/config/configSchema')
+  const fs = require('fs')
+  const path = require('path')
+
+  test('lcUserTierPath is correct', () => {
+    expect(buildDefaultConfig().LewdCorner.lcUserTierPath).toBe('/shop/index.php#user-ranks')
+  })
+
+  test('lcUserPrestigePath is correct', () => {
+    expect(buildDefaultConfig().LewdCorner.lcUserPrestigePath).toBe('/shop/index.php?rank_bundle=prestige')
+  })
+
+  test('xenforoAuth defaults match config', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'electron', 'accounts', 'xenforoAuth.js'), 'utf8')
+    expect(src).toContain("lcUserTierPath: '/shop/index.php#user-ranks'")
+    expect(src).toContain("lcUserPrestigePath: '/shop/index.php?rank_bundle=prestige'")
+  })
+})
