@@ -1,19 +1,21 @@
 # Changelog - PATCHED
 
 ## Fork's Nightly Changes
+*Changes that's already on the fork and waiting to be reviewed for merge into original Atlas*
+
+## Independent Changes
+*Any fork-only changes that is not accepted for merged but valid, or independent changes to make the fork repo releasable (e.g. custom version or preventing updates)*
+- LewdCorner member tier detection. Atlas now scrapes your LewdCorner account's shop page to determine your membership tier (Standard / Plus) and stores it alongside your credentials. Browse filters content by tier so Plus users see everything while Standard or non-login users only see what their subscription allows.[PR#391](https://github.com/towerwatchman/Atlas/pull/391)
+
+
+
+## Merged to thetowerman/Atlas's Nightly
 - Catalog tag filtering now matches Library and use exact-token filtering (avoid issue of -male +female return no result).[PR#394](https://github.com/towerwatchman/Atlas/pull/394)
 - Fixed MEGA v1 test timeout — legacy key derivation is intentionally slow and needed a longer test timeout.[PR#392](https://github.com/towerwatchman/Atlas/pull/392)
-- LewdCorner member tier detection. Atlas now scrapes your LewdCorner account's shop page to determine your membership tier (Standard / Plus) and stores it alongside your credentials. Browse filters content by tier so Plus users see everything while Standard or non-login users only see what their subscription allows.[PR#391](https://github.com/towerwatchman/Atlas/pull/391)
 - Fix multiple executable chooser rendering logic, and redo the executable chooser UI.[PR#389](https://github.com/towerwatchman/Atlas/pull/389)
 - Fixed bat file launcher for Atlas.[PR#388](https://github.com/towerwatchman/Atlas/pull/388)
 - Allow setting folder and program locations by typing or paste a path directly besides using Browse / Select Folder button.[PR#385](https://github.com/towerwatchman/Atlas/pull/385)
 - Allow Win download links to show up for Linux platform since Linux can run both Linux version and also use Wine to run Win executable.[PR#377](https://github.com/towerwatchman/Atlas/pull/377)
-
-## Independent Changes
-- *Any changes that is not accepted for merged but valid, or independent changes to make the fork repo releasable (e.g. custom version or preventing updates)*
-
-
-## Merged to thetowerman/Atlas's Nightly
 - Support Local Previews Management: [PR#379](https://github.com/towerwatchman/Atlas/pull/379)
   - Add Media Upload UI, support Custom Previews via file picker, drag upload or URL upload.
   - Add drag sort interaction in MediaTab, preserve sorting order.
