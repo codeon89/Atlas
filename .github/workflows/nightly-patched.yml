@@ -64,8 +64,7 @@ jobs:
           # Highest p among *published* matching tags. Drafts don't count, so a
           # re-run reuses its draft below instead of minting a new number.
           # Empty on cold boot, which is how the first release becomes .1.
-          max=$(gh release list --limit 100 --json tagName,isDraft --jq --arg prefix "$prefix" \
-            '[.[] | select(.isDraft == false) | .tagName | select(startswith($prefix)) | split(".") | last | select(test("^[0-9]+$")) | tonumber] | max // 0')
+          max=$(gh release list --limit 100 --json tagName,isDraft --jq "[.[] | select(.isDraft == false) | .tagName | select(startswith(\"$prefix\")) | split(\".\") | last | select(test(\"^[0-9]+$\")) | tonumber] | max // 0")
           number=$((max + 1))
           version="${base}-patched.nightly.${nightly}.${number}"
           tag="v${version}"
