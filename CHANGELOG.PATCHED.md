@@ -6,6 +6,7 @@
 
 ## Independent Changes
 *Any fork-only changes that is not accepted for merged but valid, or independent changes to make the fork repo releasable (e.g. custom version or preventing updates)*
+- Nightly-Patched releases: the fork ships its own Windows installer line (`{base}-patched.nightly.{nightly}.{p}`) with a third update channel under Settings > App Updates. Patched builds check only the fork feed; upstream nightlies surface as a read-only notice, never a download. See `docs/FORK-PATCHED-RUNBOOK.md`.
 - LewdCorner member tier detection. Atlas now scrapes your LewdCorner account's shop page to determine your membership tier (Standard / Plus) and stores it alongside your credentials. Browse filters content by tier so Plus users see everything while Standard or non-login users only see what their subscription allows.[PR#391](https://github.com/towerwatchman/Atlas/pull/391)
 
 

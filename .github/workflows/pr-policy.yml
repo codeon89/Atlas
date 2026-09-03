@@ -4,6 +4,10 @@ name: PR Policy
 # remember on every PR. Deliberately fast and dependency-free -- it runs before
 # the heavier CI job so contributors find out about a wrong base branch in
 # seconds rather than after a fifteen-minute build.
+#
+# Fork divergence (codeon89/Atlas): Rule 1 also accepts `nightly-patched`
+# (the fork's integration branch); changelog and AI-disclosure rules are not
+# enforced. Review upstream changes to this file on every merge-down.
 
 on:
   pull_request:
@@ -26,23 +30,27 @@ jobs:
           fetch-depth: 0
 
       # ── Rule 1: base branch ─────────────────────────────────────────────
-      - name: Base branch must be nightly
+      # Fork: `nightly-patched` is the fork's integration branch for fork-only
+      # work. Upstream PRs still target `nightly`; nothing else is accepted.
+      - name: Base branch must be nightly or nightly-patched
         env:
           BASE: ${{ github.event.pull_request.base.ref }}
         run: |
-          if [ "$BASE" != "nightly" ]; then
-            echo "::error::This PR targets '$BASE'. Atlas PRs must target 'nightly'."
+          if [ "$BASE" != "nightly" ] && [ "$BASE" != "nightly-patched" ]; then
+            echo "::error::This PR targets '$BASE'. Atlas PRs must target 'nightly' (upstream work) or 'nightly-patched' (fork-only work)."
             echo ""
-            echo "main is the release branch; nightly is where work integrates."
+            echo "main is the release branch; nightly is where upstream work integrates,"
+            echo "nightly-patched is where fork-only work integrates."
             echo "Retarget this PR with the 'Edit' button next to its title, then:"
             echo ""
-            echo "  git fetch origin nightly"
-            echo "  git rebase origin/nightly"
+            echo "  git fetch origin nightly nightly-patched"
+            echo "  git rebase origin/nightly          # upstream work"
+            echo "  git rebase origin/nightly-patched  # fork-only work"
             echo ""
             echo "See CONTRIBUTING.md - 'Branch from nightly'."
             exit 1
           fi
-          echo "Base branch is nightly."
+          echo "Base branch is $BASE."
 
       # ── Rules 2 and 3: tests ────────────────────────────────────────────
       - name: Code changes must come with tests
@@ -82,104 +90,12 @@ jobs:
           echo "apply the 'no-test-needed' label and say why in the description."
           exit 1
 
-      # ── Rule 5: AI disclosure ───────────────────────────────────────────
-      #
-      # Reads the PR description rather than the diff, because there is nothing
-      # in a diff that says who wrote it. Self-reported by nature: this checks
-      # that the question was ANSWERED, not that the answer is true.
-      #
-      # No escape-hatch label, unlike the test and changelog rules. Those have
-      # genuine exceptions - a CI-only change really cannot be tested. "Did a
-      # machine write this" always has an answer.
-      - name: AI assistance must be disclosed
-        if: github.event.pull_request.user.type != 'Bot'
-        env:
-          BODY: ${{ github.event.pull_request.body }}
-        run: |
-          # Strip HTML comments first. The template's guidance text contains the
-          # literal strings this greps for, so an untouched template would
-          # otherwise look like a filled-in one.
-          body=$(printf '%s' "$BODY" | perl -0777 -pe 's/<!--.*?-->//gs')
+      # ── Rule 5: AI disclosure — not enforced in fork ──────────────────────
+      # Upstream rejects PRs with a blank AI assistance section. Single-author
+      # fork: the author already knows what wrote it, so the step is dropped
+      # rather than carried as permanent red noise on every fork PR.
 
-          no_ai=$(printf '%s' "$body"  | grep -ciE '^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]*No AI was used' || true)
-          yes_ai=$(printf '%s' "$body" | grep -ciE '^[[:space:]]*-[[:space:]]*\[[xX]\][[:space:]]*AI was used' || true)
-
-          if [ "$no_ai" -eq 0 ] && [ "$yes_ai" -eq 0 ]; then
-            echo "::error::The AI assistance section was not filled in."
-            echo ""
-            echo "Tick exactly one box in the 'AI assistance' section:"
-            echo ""
-            echo "  - [x] No AI was used on this change"
-            echo "  - [ ] AI was used on this change"
-            echo ""
-            echo "This is not a rule against using AI. The reviewer needs to know"
-            echo "which tool, because different assistants fail differently and"
-            echo "knowing the tool says what to check first."
-            echo ""
-            echo "See CONTRIBUTING.md - rule 5."
-            exit 1
-          fi
-
-          if [ "$no_ai" -gt 0 ] && [ "$yes_ai" -gt 0 ]; then
-            echo "::error::Both AI assistance boxes are ticked. Tick exactly one."
-            echo ""
-            echo "If AI wrote part of it but not all, that is 'AI was used'."
-            exit 1
-          fi
-
-          if [ "$yes_ai" -gt 0 ]; then
-            # A named tool is the entire point of the disclosure - "AI was used"
-            # on its own tells the reviewer nothing they can act on.
-            tool=$(printf '%s' "$body" | grep -iE '^[[:space:]]*\*\*Tool and model:\*\*' | head -1 \
-                   | sed -E 's/^[[:space:]]*\*\*[Tt]ool and model:\*\*[[:space:]]*//' \
-                   | sed -E 's/[[:space:]]+$//')
-            # Whitespace removed only to TEST for emptiness - the name is echoed
-            # as written, so the check log reads "Claude Opus 5" and not
-            # "ClaudeOpus5".
-            if [ -z "$(printf '%s' "$tool" | tr -d '[:space:]')" ]; then
-              echo "::error::AI was declared, but no tool or model was named."
-              echo ""
-              echo "Fill in the line, for example:"
-              echo ""
-              echo "  **Tool and model:** Claude Opus 5 via Claude Code"
-              echo "  **Tool and model:** GitHub Copilot"
-              echo ""
-              echo "Which one it was is the part the reviewer acts on: it says"
-              echo "which failure modes to look for first. See CONTRIBUTING.md"
-              echo "- rule 5."
-              exit 1
-            fi
-            echo "AI assistance declared: $tool"
-            exit 0
-          fi
-
-          echo "Declared as written without AI."
-
-      # ── Changelog ───────────────────────────────────────────────────────
-      - name: Changelog entry
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-        run: |
-          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
-
-          code=$(echo "$changed" | grep -E '^(src|electron)/' || true)
-          if [ -z "$code" ]; then
-            echo "No source changes; changelog not required."
-            exit 0
-          fi
-          if echo "$changed" | grep -qx 'CHANGELOG.md'; then
-            echo "CHANGELOG.md updated."
-            exit 0
-          fi
-          if echo "$LABELS" | tr ',' '\n' | grep -qx 'no-changelog'; then
-            echo "::warning::Changelog waived by the 'no-changelog' label."
-            exit 0
-          fi
-
-          echo "::error::CHANGELOG.md was not updated."
-          echo ""
-          echo "Add an entry describing the user-visible effect. If there isn't"
-          echo "one, apply the 'no-changelog' label."
-          exit 1
+      # ── Changelog — not enforced in fork ──────────────────────────────────
+      # Upstream requires a changelog entry per change. Single-author fork:
+      # CHANGELOG.PATCHED.md gets updated when it matters, without a gate
+      # failing the PR when it doesn't.

@@ -1,5 +1,6 @@
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { formatPercent, sanitizePercentText } from '../utils/formatPercent.js'
+import { useToast } from '../components/ui/toast/ToastContext.jsx'
 
 const PACKAGE_NOT_READY_CODE = 'UPDATE_PACKAGE_NOT_READY'
 const NO_RELEASE_ON_CHANNEL_CODE = 'UPDATE_NO_RELEASE_ON_CHANNEL'
@@ -7,6 +8,8 @@ const AUTO_DISMISS_NOTICE_MS = 15000
 const AUTO_DISMISS_STATUSES = new Set(['available', 'not-available', 'error', 'package_not_ready'])
 
 export function useAppUpdate(setDbUpdateStatus) {
+  const toast = useToast()
+  const shownNightly = useRef(null)
   const [appUpdateNotice, setAppUpdateNotice] = useState({
     visible: false,
     status: '',
@@ -15,6 +18,26 @@ export function useAppUpdate(setDbUpdateStatus) {
     percent: null,
   })
   const [appUpdateActionBusy, setAppUpdateActionBusy] = useState(false)
+
+  // Upstream news is a separate, sticky notice: its only action opens release
+  // notes. It can never download anything or move the selected feed.
+  useEffect(() => {
+    let mounted = true
+    const showNightly = (notice) => {
+      if (!mounted || !notice?.tag || shownNightly.current === notice.tag) return
+      shownNightly.current = notice.tag
+      toast.info('Upstream Nightly updated', {
+        id: 'upstream-nightly',
+        message: `${notice.count > 1 ? `${notice.count} new releases. Latest: ` : ''}Atlas ${notice.version}. Your update branch is unchanged.`,
+        action: { label: 'Release notes', onClick: () => window.electronAPI.openExternalUrl(notice.url) },
+      })
+      window.electronAPI.acknowledgeUpstreamNightly?.(notice.tag).catch((err) => console.warn('Could not save nightly receipt:', err))
+    }
+    const unsubscribe = window.electronAPI.onUpstreamNightlyAvailable?.(showNightly)
+    window.electronAPI.getAppUpdateState?.().then((state) => showNightly(state?.upstreamNightly))
+      .catch((err) => console.warn('Could not restore upstream notice:', err))
+    return () => { mounted = false; unsubscribe?.() }
+  }, [toast])
 
   useEffect(() => {
     if (!appUpdateNotice.visible || !AUTO_DISMISS_STATUSES.has(appUpdateNotice.status)) return undefined
@@ -49,7 +72,12 @@ export function useAppUpdate(setDbUpdateStatus) {
   const handleUpdateStatus = useCallback(
     (status) => {
       console.log('Update status:', status)
-      if (status.status === 'available') {
+      if (status.status === 'idle') {
+        // A channel change invalidates any offer from the previous feed, in
+        // the footer too — otherwise its button still targets the old release.
+        setAppUpdateActionBusy(false)
+        setAppUpdateNotice({ visible: false, status: '', version: '', text: '', percent: null })
+      } else if (status.status === 'available') {
         setAppUpdateActionBusy(false)
         setAppUpdateNotice((notice) => {
           logFooterTransition(notice.status, 'available', 'update-status')
