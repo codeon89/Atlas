@@ -12,8 +12,12 @@ import { LINKS } from './links.js'
  * app.getVersion() returns package.json's version, which carries no prefix, so
  * this cannot fire today -- but `vv1.2.3` is not a tag either workflow creates,
  * and a URL that 404s is worse than one built from a normalized string.
+ *
+ * Release notes follow build identity, not the selected feed: patched
+ * builds link to the fork's releases, everything else links upstream.
  */
 export function releaseUrlFor(version) {
   const tag = String(version ?? '').trim().replace(/^v+/i, '')
-  return `${LINKS.github}/releases/tag/v${tag}`
+  const repo = tag.includes('-patched.') ? 'https://github.com/codeon89/Atlas' : LINKS.github
+  return `${repo}/releases/tag/v${tag}`
 }
