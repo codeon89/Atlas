@@ -95,9 +95,13 @@ const buildDefaultConfig = (dataDir = '') => ({
   // THIS baseline rather than the running build's version, which is what lets a
   // channel switch behave correctly. Empty = never installed from that channel.
   // Was being wiped on every settings save; see the header comment.
+  // `patchedVersion` is the fork channel's baseline. `upstreamNightlyTag`
+  // is not a baseline, just a receipt for the last upstream notice shown.
   Updates: {
     stableVersion: '',
     nightlyVersion: '',
+    patchedVersion: '',
+    upstreamNightlyTag: '',
   },
   Library: {
     rootPath: dataDir,

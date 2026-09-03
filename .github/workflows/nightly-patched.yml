@@ -1,0 +1,262 @@
+name: Atlas Nightly-Patched Prerelease
+
+# Fork-only release flow. Modelled on upstream's nightly.yml (draft-first,
+# verify-then-publish): single Windows leg, full `npm run check` gate inline,
+# versions naming the upstream nightly they were built from.
+on:
+  push:
+    branches: [nightly-patched]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Queued, never cancelled: two runs minting release numbers concurrently could
+# compute the same `p`, and a half-uploaded release is worse than a late one.
+concurrency:
+  group: nightly-patched-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    # This file must never publish from anywhere else: not from a fork of this
+    # fork, not from a feature branch. Downstream jobs cascade-skip when this
+    # one does, so guarding here covers the whole workflow.
+    if: github.repository == 'codeon89/Atlas' && github.ref == 'refs/heads/nightly-patched'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      nightly: ${{ steps.version.outputs.nightly }}
+      number: ${{ steps.version.outputs.number }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Before any draft exists: a red build must leave no trace on Releases.
+      - name: Check source and regression tests
+        run: npm run check
+
+      - name: Resolve patched version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=$(node -p "require('./package.json').version")
+          nightly=$(tr -d ' \t\r\n' < UPSTREAM_NIGHTLY)
+          if ! [[ "$nightly" =~ ^(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::UPSTREAM_NIGHTLY must be a non-negative integer (got '$nightly'). Bump it to the merged nightly and push again."
+            exit 1
+          fi
+          prefix="v${base}-patched.nightly.${nightly}."
+          # Highest p among *published* matching tags. Drafts don't count, so a
+          # re-run reuses its draft below instead of minting a new number.
+          # Empty on cold boot, which is how the first release becomes .1.
+          max=$(gh release list --limit 100 --json tagName,isDraft --jq --arg prefix "$prefix" \
+            '[.[] | select(.isDraft == false) | .tagName | select(startswith($prefix)) | split(".") | last | select(test("^[0-9]+$")) | tonumber] | max // 0')
+          number=$((max + 1))
+          version="${base}-patched.nightly.${nightly}.${number}"
+          tag="v${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "nightly=$nightly" >> "$GITHUB_OUTPUT"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "Patched version: $version"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.version.outputs.tag }}"
+          # A re-run finds its own still-draft tag and reuses it, so retrying
+          # a failed build is safe and never burns a number.
+          if gh release view "$tag" --json isDraft --jq -e '.isDraft' >/dev/null 2>&1; then
+            echo "Release $tag already exists as a draft; reusing it."
+            exit 0
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::Release $tag is already published; refusing to overwrite it."
+            exit 1
+          fi
+          gh release create "$tag" \
+            --draft \
+            --prerelease \
+            --target "${{ github.sha }}" \
+            --title "Atlas ${{ steps.version.outputs.version }}" \
+            --notes "Nightly-Patched build from ${{ github.sha }}. Based on upstream nightly v$(node -p "require('./package.json').version")-nightly.${{ steps.version.outputs.nightly }}."
+
+  build:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PATCHED_NIGHTLY: ${{ needs.prepare.outputs.nightly }}
+      PATCHED_BUILD_NUMBER: ${{ needs.prepare.outputs.number }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # The publish token arrives via env below instead, so a compromised
+          # step cannot push with the checkout credential.
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Version, owner (fork repo) and channel (patched) come from
+      # scripts/build-patched.js — never from package.json at rest.
+      - name: Build and upload Windows installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run publish
+
+      - name: Assert installer exists
+        run: |
+          $exe = Get-ChildItem -Path "release/patched-$env:PATCHED_NIGHTLY-$env:PATCHED_BUILD_NUMBER" -Filter *.exe
+          if (-not $exe) { throw 'No installer was produced.' }
+          $exe | ForEach-Object { Write-Output "$($_.Name) ($($_.Length) bytes)" }
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-patched-installer
+          path: release/patched-*/*.exe
+          if-no-files-found: error
+
+  virus-scan:
+    name: ClamAV scan of patched artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    # Report-only: ClamAV can false-positive on unsigned/packed Electron
+    # installers, so a detection is surfaced loudly but never blocks a
+    # personal release. Flip to 'true' to make hits fail.
+    env:
+      FAIL_ON_DETECTION: 'false'
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-patched-installer
+          path: scan/windows
+        continue-on-error: true
+
+      - name: Install ClamAV
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clamav
+          sudo systemctl stop clamav-freshclam || true
+
+      - name: Update virus definitions
+        run: sudo freshclam || echo "freshclam returned non-zero (definitions may already be current); continuing."
+
+      - name: Scan artifacts
+        id: scan
+        run: |
+          set +e
+          shopt -s nullglob globstar
+          files=(scan/**/*.exe)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No patched artifacts were downloaded to scan." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "detections=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "## ClamAV scan results (nightly-patched)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Artifact | SHA-256 | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+
+          total_infected=0
+          for f in "${files[@]}"; do
+            sha=$(sha256sum "$f" | awk '{print $1}')
+            out=$(clamscan --no-summary --stdout "$f" 2>&1)
+            code=$?
+            name=$(basename "$f")
+            if [ $code -eq 0 ]; then
+              result="✅ Clean"
+            elif [ $code -eq 1 ]; then
+              sig=$(echo "$out" | grep -o ': .* FOUND' | sed 's/^: //; s/ FOUND$//' | paste -sd '; ' -)
+              result="🚨 INFECTED — ${sig:-detection}"
+              total_infected=$((total_infected + 1))
+            else
+              result="⚠️ Scan error (exit $code)"
+            fi
+            echo "| \`$name\` | \`$sha\` | $result |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$name  $sha  $result"
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Report-only. For a multi-engine view, submit an artifact's SHA-256 at https://www.virustotal.com/gui/search_ ." >> "$GITHUB_STEP_SUMMARY"
+          echo "detections=$total_infected" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce detection policy
+        if: steps.scan.outputs.detections != '0' && env.FAIL_ON_DETECTION == 'true'
+        run: |
+          echo "ClamAV reported ${{ steps.scan.outputs.detections }} infected artifact(s) and FAIL_ON_DETECTION is true."
+          exit 1
+
+  # Nothing is visible to users until this runs: a failed build leaves a draft
+  # behind, never a half-populated prerelease.
+  publish-release:
+    name: Publish patched prerelease
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify complete assets, then publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.prepare.outputs.tag }}"
+          version="${{ needs.prepare.outputs.version }}"
+
+          # Asset names contain spaces (`Atlas-Setup 0.9.9-...exe`), so names
+          # are newline-joined and matched whole-line: splitting on spaces
+          # would shred the filenames the asserts look for.
+          names=$(gh release view "$tag" --json assets --jq '[.assets[] | select(.size > 0 and .state == "uploaded") | .name] | join("\n")')
+          echo "Assets on $tag:"
+          echo "$names"
+
+          # Publishing with a missing installer, blockmap or channel manifest
+          # would ship a release the updater cannot use. Refuse and leave the
+          # draft for a re-run instead.
+          for suffix in ".exe" ".exe.blockmap"; do
+            if ! echo "$names" | grep -qxF "Atlas-Setup ${version}${suffix}"; then
+              echo "::error::Missing or incomplete asset: Atlas-Setup ${version}${suffix}."
+              exit 1
+            fi
+          done
+          if ! echo "$names" | grep -qxF 'patched.yml'; then
+            echo "::error::Missing or incomplete asset: patched.yml."
+            exit 1
+          fi
+
+          gh release edit "$tag" --draft=false --prerelease --latest=false
+          echo "Published $tag"

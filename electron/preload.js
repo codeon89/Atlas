@@ -48,6 +48,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
   checkUpdates: () => ipcRenderer.invoke("check-updates"),
   checkAppUpdate: () => ipcRenderer.invoke("check-app-update"),
   getAppUpdateState: () => ipcRenderer.invoke("get-app-update-state"),
+  // Receipts are validated against the pending notice in main, not taken on
+  // trust: the event below carries metadata only, never an installer.
+  acknowledgeUpstreamNightly: (tag) => ipcRenderer.invoke("acknowledge-upstream-nightly", tag),
+  onUpstreamNightlyAvailable: (callback) => {
+    const handler = (event, notice) => callback(notice);
+    ipcRenderer.on("upstream-nightly-available", handler);
+    return () => ipcRenderer.removeListener("upstream-nightly-available", handler);
+  },
   downloadAppUpdate: () => ipcRenderer.invoke("download-app-update"),
   downloadAndInstallAppUpdate: () =>
     ipcRenderer.invoke("download-and-install-app-update"),
