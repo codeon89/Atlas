@@ -45,9 +45,10 @@ No prior releases exist, so counting starts at zero and the first release is
 
 ## Fork repository settings (one-time)
 
-In the fork's GitHub Actions settings, disable the upstream `main` and
-`nightly` workflows so a stray push can never publish upstream. `pr-policy`
-stays enabled: it is fork-aware (accepts `nightly-patched` bases, no
-changelog or AI-disclosure enforcement), so it gates fork PRs on base and
-tests instead of failing them.
+In the fork's GitHub Actions settings, disable the upstream `main`, `nightly`,
+and `CI` workflows so a stray push can never publish upstream and PRs run the
+fork's cached `ci-patched.yml` instead of both (same gate, skips `npm ci` when
+the lock file is unchanged). `pr-policy` stays enabled: it is fork-aware
+(accepts `nightly-patched` bases, no changelog or AI-disclosure enforcement),
+so it gates fork PRs on base and tests instead of failing them.
 Review upstream changes to it on every merge-down.

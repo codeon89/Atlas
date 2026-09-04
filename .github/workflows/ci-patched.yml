@@ -1,0 +1,56 @@
+name: CI-Patched
+
+# Fork-only copy of upstream's CI with a node_modules cache in front of
+# `npm ci`. Upstream's ci.yml stays byte-identical so nightly merges stay
+# clean; the upstream CI workflow is disabled in the fork's Actions settings
+# so PRs run this one instead of both. Same triggers, same steps, same gate.
+on:
+  push:
+    branches: [main, nightly]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Patched checks
+    # Never runs outside the fork: if this file ever reaches upstream by a bad
+    # merge, it stays silent there instead of double-running their CI.
+    if: github.repository == 'codeon89/Atlas'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Restore node_modules
+        id: nm-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: nm-v1-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      # Cache hit means the lock file is unchanged, so the tree on disk is
+      # exactly what `npm ci` would produce -- skip the ~2 min reinstall.
+      - name: Install dependencies
+        if: steps.nm-cache.outputs.cache-hit != 'true'
+        run: npm ci --no-audit --no-fund
+
+      - name: Build browser extension
+        run: npm run build:extension
+
+      - name: Run Vitest suite
+        run: npm run test:run
+
+      - name: Run legacy check scripts + build
+        # `npm run check` also runs test:run (harmless) and vite build, giving us
+        # the syntax checks, asset/layout checks, the test suite, and a renderer
+        # build in one gate. git diff --check catches whitespace/conflict markers.
+        run: npm run check

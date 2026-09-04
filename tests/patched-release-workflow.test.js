@@ -48,6 +48,22 @@ describe('nightly-patched release workflow', () => {
     expect(workflow.indexOf('.exe.blockmap')).toBeGreaterThan(verifyAt)
   })
 
+  // Both legs share one draft: publishing with either platform missing would
+  // ship a half-populated prerelease, the failure upstream's gate exists for.
+  it('builds both platforms and gates publish on both', () => {
+    expect(workflow).toContain('os: [windows-latest, ubuntu-latest]')
+    expect(workflow).toContain('libarchive-tools')
+    expect(workflow).toContain('linux-patched-packages')
+    expect(workflow).toContain('patched-linux.yml')
+    expect(workflow).toContain('.AppImage')
+  })
+
+  it('scans Linux packages alongside the Windows installer', () => {
+    const scanAt = workflow.indexOf('Scan artifacts')
+    expect(scanAt).toBeGreaterThan(-1)
+    expect(workflow.slice(scanAt)).toContain('*.deb')
+  })
+
   it('publishes as a non-latest prerelease only after verification', () => {
     const editAt = workflow.indexOf('gh release edit')
     expect(editAt).toBeGreaterThan(-1)

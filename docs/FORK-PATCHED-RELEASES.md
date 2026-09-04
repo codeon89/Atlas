@@ -6,7 +6,9 @@ Plain-language reference for the fork's own release line. Procedures live in
 ## What it is
 
 Nightly-Patched is this fork's installable release line: upstream Atlas nightly
-plus the fork's patches, as a Windows installer with working auto-update.
+plus the fork's patches, as Windows and Linux installers with working
+auto-update (Windows `exe`, Linux `deb`/`AppImage`/`pacman`, all on the one
+draft release).
 Settings offers three update channels — Stable and Nightly (upstream's,
 explicit opt-in with a replacing warning) and Nightly-Patched (this fork, the
 default for fork builds).

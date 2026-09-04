@@ -4,7 +4,7 @@ import { createRequire } from 'node:module'
 const require = createRequire(import.meta.url)
 // Required, never executed: the builder only runs under `require.main`, so
 // importing is side-effect free (no electron-builder load, no git, no disk).
-const { resolvePatchedVersion, parseNonNegativeInt, readUpstreamNightly } = require('../scripts/build-patched.js')
+const { resolvePatchedVersion, parseNonNegativeInt, readUpstreamNightly, resolvePatchedTarget } = require('../scripts/build-patched.js')
 // Same semver copy electron-updater compares with: a version that only parses
 // under a different copy is a version the updater itself would reject.
 const semver = require('electron-updater/node_modules/semver')
@@ -70,6 +70,18 @@ describe('fork version ordering (Decision 2)', () => {
   // what routes fork builds to `patched.yml` instead of `nightly.yml`.
   it('keeps patched as the channel word', () => {
     expect(semver.prerelease('0.9.9-patched.nightly.494.1')[0]).toBe('patched')
+  })
+})
+
+describe('resolvePatchedTarget', () => {
+  // One script serves both CI legs: the runner OS decides nsis vs
+  // deb/AppImage/pacman, so there is no flag to pass wrong.
+  it.each([
+    ['linux', 'linux'],
+    ['win32', 'windows'],
+    ['darwin', 'windows'],
+  ])('maps %p to %p', (platform, expected) => {
+    expect(resolvePatchedTarget(platform)).toBe(expected)
   })
 })
 
