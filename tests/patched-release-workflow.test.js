@@ -66,6 +66,11 @@ describe('nightly-patched release workflow', () => {
     expect(workflow).toContain('UPSTREAM_NIGHTLY')
   })
 
+  it('caches node_modules and skips reinstall on a hit', () => {
+    expect(workflow).toContain('path: node_modules')
+    expect(workflow).toContain("steps.nm-cache.outputs.cache-hit != 'true'")
+  })
+
   it('reuses drafts via a plain jq comparison (gh --jq takes only an expression)', () => {
     expect(workflow).toContain("--jq '.isDraft'")
     expect(workflow).not.toContain('--jq -e')

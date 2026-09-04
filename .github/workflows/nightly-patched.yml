@@ -59,9 +59,17 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Install dependencies
+      - name: Restore node_modules
         if: steps.nobuild.outputs.skip != 'true'
-        run: npm ci
+        id: nm-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: nm-v1-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        if: steps.nobuild.outputs.skip != 'true' && steps.nm-cache.outputs.cache-hit != 'true'
+        run: npm ci --no-audit --no-fund
 
       # Before any draft exists: a red build must leave no trace on Releases.
       - name: Check source and regression tests
