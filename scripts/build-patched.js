@@ -31,6 +31,13 @@ function readUpstreamNightly() {
   return parseNonNegativeInt(raw, 'UPSTREAM_NIGHTLY')
 }
 
+// Which builder target to use follows the runner OS, so one script serves
+// both CI legs without flags to get wrong. PATCHED_PLATFORM overrides it
+// for local checks (e.g. asserting the Linux branch resolves on Windows).
+function resolvePatchedTarget(platform = process.env.PATCHED_PLATFORM || process.platform) {
+  return platform === 'linux' ? 'linux' : 'windows'
+}
+
 // Builds `0.9.9-patched.nightly.494.1` from its parts. The base is everything
 // before the first hyphen, so a prerelease base can't leak into the tail.
 function resolvePatchedVersion(pkgVersion, nightly, number) {
@@ -58,9 +65,13 @@ async function run() {
   }
   const version = resolvePatchedVersion(pkg.version, nightly, number)
   const commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: projectDir, encoding: 'utf8', windowsHide: true }).trim()
+  // One leg per runner OS; both upload to the same draft release.
+  const target = resolvePatchedTarget()
   await build({
     projectDir,
-    targets: Platform.WINDOWS.createTarget(['nsis'], Arch.x64),
+    targets: target === 'linux'
+      ? Platform.LINUX.createTarget(['deb', 'AppImage', 'pacman'], Arch.x64)
+      : Platform.WINDOWS.createTarget(['nsis'], Arch.x64),
     publish: publish ? 'always' : 'never',
     config: {
       directories: { output: `release/patched-${nightly}-${number}` },
@@ -90,4 +101,4 @@ if (require.main === module) {
   })
 }
 
-module.exports = { resolvePatchedVersion, parseNonNegativeInt, readUpstreamNightly }
+module.exports = { resolvePatchedVersion, parseNonNegativeInt, readUpstreamNightly, resolvePatchedTarget }

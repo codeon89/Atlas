@@ -1,8 +1,9 @@
 name: Atlas Nightly-Patched Prerelease
 
 # Fork-only release flow. Modelled on upstream's nightly.yml (draft-first,
-# verify-then-publish): single Windows leg, full `npm run check` gate inline,
-# versions naming the upstream nightly they were built from.
+# verify-then-publish): Windows + Linux legs sharing one draft release, full
+# `npm run check` gate inline, versions naming the upstream nightly they were
+# built from.
 on:
   push:
     branches: [nightly-patched]
@@ -146,11 +147,14 @@ jobs:
     needs: prepare
     # Skip when prepare is skipped (repo guard) or opted out via [no-build].
     if: needs.prepare.result == 'success' && needs.prepare.outputs.skip != 'true'
-    runs-on: windows-latest
-    timeout-minutes: 45
-    defaults:
-      run:
-        shell: pwsh
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not cancel the other mid-upload, which would
+      # leave the draft holding a partial asset set.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    timeout-minutes: 60
     env:
       PATCHED_NIGHTLY: ${{ needs.prepare.outputs.nightly }}
       PATCHED_BUILD_NUMBER: ${{ needs.prepare.outputs.number }}
@@ -171,25 +175,74 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools rpm
+          # appimagetool (bundled by electron-builder for the AppImage target)
+          # is itself an AppImage and needs FUSE2 to run. Ubuntu 24.04
+          # renamed libfuse2 -> libfuse2t64; keep the old name as fallback.
+          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
+
       # Version, owner (fork repo) and channel (patched) come from
-      # scripts/build-patched.js — never from package.json at rest.
+      # scripts/build-patched.js — never from package.json at rest. The script
+      # picks nsis vs deb/AppImage/pacman from the runner OS, so both legs run
+      # the same command and upload to the same draft.
       - name: Build and upload Windows installer
+        if: matrix.os == 'windows-latest'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
         run: npm run publish
 
-      - name: Assert installer exists
+      - name: Build and upload Linux packages
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: npm run publish
+
+      - name: Assert installer exists (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
         run: |
           $exe = Get-ChildItem -Path "release/patched-$env:PATCHED_NIGHTLY-$env:PATCHED_BUILD_NUMBER" -Filter *.exe
           if (-not $exe) { throw 'No installer was produced.' }
           $exe | ForEach-Object { Write-Output "$($_.Name) ($($_.Length) bytes)" }
 
+      - name: Assert packages exist (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(release/patched-"$PATCHED_NIGHTLY"-"$PATCHED_BUILD_NUMBER"/*.deb release/patched-"$PATCHED_NIGHTLY"-"$PATCHED_BUILD_NUMBER"/*.AppImage release/patched-"$PATCHED_NIGHTLY"-"$PATCHED_BUILD_NUMBER"/*.pacman)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No Linux packages were produced."
+            exit 1
+          fi
+          printf '%s\n' "${files[@]}"
+
       - name: Upload Windows artifact
+        if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: windows-patched-installer
           path: release/patched-*/*.exe
+          if-no-files-found: error
+
+      - name: Upload Linux artifact
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-patched-packages
+          path: |
+            release/patched-*/*.deb
+            release/patched-*/*.AppImage
+            release/patched-*/*.pacman
           if-no-files-found: error
 
   virus-scan:
@@ -209,6 +262,13 @@ jobs:
           path: scan/windows
         continue-on-error: true
 
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-patched-packages
+          path: scan/linux
+        continue-on-error: true
+
       - name: Install ClamAV
         run: |
           sudo apt-get update
@@ -223,7 +283,7 @@ jobs:
         run: |
           set +e
           shopt -s nullglob globstar
-          files=(scan/**/*.exe)
+          files=(scan/**/*.exe scan/**/*.AppImage scan/**/*.deb scan/**/*.pacman)
           if [ ${#files[@]} -eq 0 ]; then
             echo "No patched artifacts were downloaded to scan." | tee -a "$GITHUB_STEP_SUMMARY"
             echo "detections=0" >> "$GITHUB_OUTPUT"
@@ -289,8 +349,9 @@ jobs:
           echo "$names"
 
           # Publishing with a missing installer, blockmap or channel manifest
-          # would ship a release the updater cannot use. Refuse and leave the
-          # draft for a re-run instead.
+          # would ship a release the updater cannot use. Either platform
+          # missing refuses the whole release and leaves the draft for a
+          # re-run instead.
           for suffix in ".exe" ".exe.blockmap"; do
             if ! echo "$names" | grep -qxF "Atlas-Setup-${version}${suffix}"; then
               echo "::error::Missing or incomplete asset: Atlas-Setup-${version}${suffix}."
@@ -299,6 +360,16 @@ jobs:
           done
           if ! echo "$names" | grep -qxF 'patched.yml'; then
             echo "::error::Missing or incomplete asset: patched.yml."
+            exit 1
+          fi
+          for ext in ".deb" ".AppImage" ".pacman"; do
+            if ! echo "$names" | grep -qE "\\${ext}$"; then
+              echo "::error::Missing or incomplete asset: no *${ext} on $tag."
+              exit 1
+            fi
+          done
+          if ! echo "$names" | grep -qxF 'patched-linux.yml'; then
+            echo "::error::Missing or incomplete asset: patched-linux.yml."
             exit 1
           fi
 

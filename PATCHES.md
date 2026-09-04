@@ -1,18 +1,24 @@
-# CHANGELOG - PATCHED
+# CUMMULATIVE PATCHES
 
-**v0.9.9-patched.nightly.494.2**
+## Pending Patched Changes
+  *Changes that's already on the fork and waiting to be reviewed for merge into original Atlas*
   - Removed the stale restart popup and hint on the Show debug console toggle — it applies immediately to all open windows.[PR#399](https://github.com/towerwatchman/Atlas/pull/399)
     - (Dev-Only) DevTools no longer auto-opens in dev mode unless explicitly enabled in config.
-  - Nightly-Patched: support Linux builds & patch ci runs. [PR#20](https://github.com/codeon89/Atlas/pull/20)
-
-**v0.9.9-patched.nightly.494.1**
   - Update debounce logic for Browse and Library: Search in Catalog Browse and Library now debounces the text input and waits for a pause before filtering. Previously every keystroke updated `activeFilters.text` and ran `filterGamesWithState` (Library) or scheduled a catalog fetch, causing input lag on large libraries and a wasted local-filter pass even while browsing the server-side catalog. The input still echoes instantly from local state; clear bypasses the delay.[PR#398](https://github.com/towerwatchman/Atlas/pull/398)
-  - LewdCorner member tier detection. Atlas now scrapes your LewdCorner account's shop page to determine your membership tier (Standard / Plus) and stores it alongside your credentials. Browse filters content by tier so Plus users see everything while Standard or non-login users only see what their subscription allows.[PR#391](https://github.com/towerwatchman/Atlas/pull/391)
-  - Support `[no-build]` detection in your HEAD commit message when pushing without wanting a release (docs or changelog-only pushes) or merge existing change from original Atlas.[PR#19](https://github.com/codeon89/Atlas/pull/19)
-  - Nightly-Patched releases: the fork ships its own Windows + Linux installer line (`{base}-patched.nightly.{nightly}.{p}`) with a third update channel under Settings > App Updates. Patched builds check only the fork feed; upstream nightlies surface as a read-only notice, never a download. See `docs/FORK-PATCHED-RUNBOOK.md`.[PR#19](https://github.com/codeon89/Atlas/pull/19)
-  
 
-**Previously merged before packaging**
+
+## Exclusive Fork Changes
+  *Any fork-only changes that is not accepted for merged from upstream*
+  - LewdCorner member tier detection. Atlas now scrapes your LewdCorner account's shop page to determine your membership tier (Standard / Plus) and stores it alongside your credentials. Browse filters content by tier so Plus users see everything while Standard or non-login users only see what their subscription allows.[PR#391](https://github.com/towerwatchman/Atlas/pull/391)
+
+## Fork's System Change
+  *internal change that's not features but backend requirement for forks to release self-builds*
+  - Support Linux builds & patch ci runs. [PR#20](https://github.com/codeon89/Atlas/pull/20)
+  - Support `[no-build]` detection in your HEAD commit message when pushing without wanting a release (docs or changelog-only pushes) or merge existing change from original Atlas.[PR#19](https://github.com/codeon89/Atlas/pull/19) 
+  - Nightly-Patched releases: the fork ships its own Windows + Linux installer line (`{base}-patched.nightly.{nightly}.{p}`) with a third update channel under Settings > App Updates. Patched builds check only the fork feed; upstream nightlies surface as a read-only notice, never a download. See `docs/FORK-PATCHED-RUNBOOK.md`. [PR#19](https://github.com/codeon89/Atlas/pull/19)
+
+
+## Merged to thetowerman/Atlas's Nightly
   - Catalog tag filtering now matches Library and use exact-token filtering (avoid issue of -male +female return no result).[PR#394](https://github.com/towerwatchman/Atlas/pull/394)
   - Fixed MEGA v1 test timeout — legacy key derivation is intentionally slow and needed a longer test timeout.[PR#392](https://github.com/towerwatchman/Atlas/pull/392)
   - Fix multiple executable chooser rendering logic, and redo the executable chooser UI.[PR#389](https://github.com/towerwatchman/Atlas/pull/389)
